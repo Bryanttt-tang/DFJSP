@@ -312,7 +312,7 @@ class StaticFJSPEnv(gym.Env):
 class PoissonDynamicFJSPEnv(gym.Env):
     """
     Dynamic FJSP Environment with Poisson-distributed job arrivals.
-    FIXED to use the SAME structure as successful StaticFJSPEnv and PerfectKnowledgeFJSPEnv.
+    
     """
     
     metadata = {"render.modes": ["human"]}
@@ -360,18 +360,18 @@ class PoissonDynamicFJSPEnv(gym.Env):
         self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
         self.total_operations = sum(len(ops) for ops in self.jobs.values())
         
-        # USE SAME ACTION SPACE as successful environments (FIXED, not dynamic)
-        self.action_space = spaces.Discrete(
-            min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
-        )
+        # Dynamic action space: action = index into valid_actions list
+        # Maximum possible actions = num_jobs * num_machines (each job can have at most one ready operation)
+        max_possible_actions = self.num_jobs * len(self.machines)
+        self.action_space = spaces.Discrete(max_possible_actions)
         
-        # USE SAME OBSERVATION SPACE as successful environments
+        # Simplified observation space similar to successful environments
         obs_size = (
             len(self.machines) +                    # Machine availability
             self.num_jobs * self.max_ops_per_job +  # Operation completion status
             self.num_jobs +                         # Job progress ratios  
-            self.num_jobs +                         # Job arrival status
-            1                                       # Current makespan
+            self.num_jobs +                         # Job arrival status (simple binary)
+            1                                       # Current time/makespan
         )
         
         self.observation_space = spaces.Box(
@@ -382,32 +382,43 @@ class PoissonDynamicFJSPEnv(gym.Env):
         self._reset_state()
 
     def _reset_state(self):
-        """Reset all environment state variables - SAME as successful environments."""
+        """Reset all environment state variables."""
         self.machine_next_free = {m: 0.0 for m in self.machines}
+        self.machine_workload = {m: 0.0 for m in self.machines}
         self.schedule = {m: [] for m in self.machines}
         self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
         self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
         self.next_operation = {job_id: 0 for job_id in self.job_ids}
         
-        self.current_makespan = 0.0
+        self.current_time = 0.0
         self.operations_scheduled = 0
         self.episode_step = 0
-        self.max_episode_steps = self.total_operations * 2
+        self.max_episode_steps = self.total_operations * 3
         
-        # Job arrival management - simplified
+        # Job arrival management
         self.arrived_jobs = set(self.initial_job_ids)  # Initial jobs available immediately
-        self.job_arrival_times = {}
+        self.arrival_times = {}
+        self.next_arrival_events = []
+        
+        # Dynamic action space: list of valid (job_id, machine_name) pairs
+        self.valid_actions = []
         
         # Generate Poisson arrival times for dynamic jobs
         self._generate_poisson_arrivals()
+        
+        # Update valid actions after initialization
+        self._update_valid_actions()
+        
+        # Performance tracking
+        self.total_idle_time = 0.0
+        self.total_tardiness = 0.0
+        self.num_completed_jobs = 0
 
     def _generate_poisson_arrivals(self):
-        """Generate arrival times for dynamic jobs using Poisson process."""
-        # Initialize arrival times
-        for job_id in self.initial_job_ids:
-            self.job_arrival_times[job_id] = 0.0
+        """Generate INTEGER arrival times for dynamic jobs using Poisson process."""
+        self.arrival_times = {job_id: 0.0 for job_id in self.initial_job_ids}
         
-        # Generate inter-arrival times using exponential distribution
+        # Generate inter-arrival times using exponential distribution, then round to integers
         current_time = 0.0
         for job_id in self.dynamic_job_ids:
             inter_arrival_time = np.random.exponential(1.0 / self.arrival_rate)
@@ -417,12 +428,16 @@ class PoissonDynamicFJSPEnv(gym.Env):
             integer_arrival_time = round(current_time)
             
             if integer_arrival_time <= self.max_time_horizon:
-                self.job_arrival_times[job_id] = float(integer_arrival_time)
+                self.arrival_times[job_id] = float(integer_arrival_time)
+                self.next_arrival_events.append((float(integer_arrival_time), job_id))
             else:
-                self.job_arrival_times[job_id] = float('inf')  # Won't arrive in this episode
+                self.arrival_times[job_id] = float('inf')  # Won't arrive in this episode
+        
+        # Sort arrival events by time
+        self.next_arrival_events.sort(key=lambda x: x[0])
 
     def reset(self, seed=None, options=None):
-        """Reset the environment for a new episode - SAME structure as successful environments."""
+        """Reset the environment for a new episode."""
         global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
         
         if seed is not None:
@@ -435,7 +450,7 @@ class PoissonDynamicFJSPEnv(gym.Env):
         # Track arrival times for analysis
         TRAINING_EPISODE_COUNT += 1
         episode_arrivals = []
-        for job_id, arr_time in self.job_arrival_times.items():
+        for job_id, arr_time in self.arrival_times.items():
             if arr_time != float('inf') and arr_time > 0:  # Only dynamic arrivals
                 episode_arrivals.append(arr_time)
         
@@ -444,74 +459,75 @@ class PoissonDynamicFJSPEnv(gym.Env):
         
         return self._get_observation(), {}
 
-    def _decode_action(self, action):
-        """Decode action - SAME as successful environments."""
-        action = int(action) % self.action_space.n
-        num_machines = len(self.machines)
-        ops_per_job = self.max_ops_per_job
+    def _update_valid_actions(self):
+        """
+        Update the list of valid actions based on current state.
+        Each action is a (job_id, machine_name) pair for the next available operation.
+        This handles both initial jobs and dynamically arriving jobs.
+        """
+        self.valid_actions = []
         
-        job_idx = action // (ops_per_job * num_machines)
-        op_idx = (action % (ops_per_job * num_machines)) // num_machines
-        machine_idx = action % num_machines
-        
-        job_idx = min(job_idx, self.num_jobs - 1)
-        machine_idx = min(machine_idx, len(self.machines) - 1)
-        
-        return job_idx, op_idx, machine_idx
-
-    def _is_valid_action(self, job_idx, op_idx, machine_idx):
-        """Check if action is valid - SAME as successful environments."""
-        if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
-            return False
-        
-        job_id = self.job_ids[job_idx]
-        
-        # Check if job has arrived
-        if job_id not in self.arrived_jobs:
-            return False
-            
-        # Check operation index validity
-        if not (0 <= op_idx < len(self.jobs[job_id])):
-            return False
-            
-        # Check if this is the next operation
-        if op_idx != self.next_operation[job_id]:
-            return False
-            
-        # Check machine compatibility
-        machine_name = self.machines[machine_idx]
-        if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
-            return False
-            
-        return True
-
-    def action_masks(self):
-        """Generate action masks - SAME as successful environments."""
-        mask = np.full(self.action_space.n, False, dtype=bool)
-        
-        if self.operations_scheduled >= self.total_operations:
-            return mask
-
-        valid_action_count = 0
-        for job_idx, job_id in enumerate(self.job_ids):
+        for job_id in self.job_ids:
+            # Skip if job hasn't arrived yet
             if job_id not in self.arrived_jobs:
                 continue
                 
+            # Get the next operation index for this job
             next_op_idx = self.next_operation[job_id]
+            
+            # Skip if job is complete
             if next_op_idx >= len(self.jobs[job_id]):
                 continue
                 
-            for machine_idx, machine in enumerate(self.machines):
-                if machine in self.jobs[job_id][next_op_idx]['proc_times']:
-                    action = job_idx * (self.max_ops_per_job * len(self.machines)) + next_op_idx * len(self.machines) + machine_idx
-                    if action < self.action_space.n:
-                        mask[action] = True
-                        valid_action_count += 1
+            # Get the operation data
+            operation = self.jobs[job_id][next_op_idx]
+            
+            # Add all valid (job, machine) pairs for this operation
+            for machine_name in operation['proc_times'].keys():
+                if machine_name in self.machines:
+                    self.valid_actions.append((job_id, machine_name))
+
+        # If no valid actions, we need to advance time to next job arrival
+        if not self.valid_actions:
+            self._advance_time_to_next_arrival()
+
+    def _advance_time_to_next_arrival(self):
+        """Advance time to the next job arrival if no operations are ready"""
+        if self.next_arrival_events:
+            next_arrival_time = self.next_arrival_events[0][0]
+            if next_arrival_time <= self.max_time_horizon:
+                self.current_time = next_arrival_time
+                self._update_arrivals(self.current_time)
+                # Update valid actions after new arrivals
+                self._update_valid_actions()
+
+    def action_masks(self):
+        """Return action mask for MaskablePPO using dynamic action space."""
+        mask = np.zeros(self.action_space.n, dtype=bool)
         
-        if valid_action_count == 0:
-            mask.fill(True)
+        # Mark valid actions based on current valid_actions list
+        for i in range(len(self.valid_actions)):
+            if i < self.action_space.n:
+                mask[i] = True
+        
+        # If no valid actions, enable the first action to prevent crashes
+        if not np.any(mask) and self.action_space.n > 0:
+            mask[0] = True
             
         return mask
+
+    def _update_arrivals(self, current_time):
+        """Update job arrivals based on current time."""
+        newly_arrived = []
+        
+        while (self.next_arrival_events and 
+               self.next_arrival_events[0][0] <= current_time):
+            arrival_time, job_id = self.next_arrival_events.pop(0)
+            if job_id not in self.arrived_jobs:
+                self.arrived_jobs.add(job_id)
+                newly_arrived.append(job_id)
+        
+        return newly_arrived
 
     def step(self, action):
         """Execute one step in the environment using dynamic actions."""
