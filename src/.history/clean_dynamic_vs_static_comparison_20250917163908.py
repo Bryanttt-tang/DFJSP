@@ -578,28 +578,143 @@ class PoissonDynamicFJSPEnv(gym.Env):
         
         return self._get_observation(), reward, terminated, False, info
 
-    def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan, num_new_arrivals):
-        """SIMPLIFIED reward function matching successful environments."""
+    def _calculate_reward(self, proc_time, idle_time, done, num_new_arrivals, 
+                         previous_time, current_time, job_id):
+        """Enhanced reward function for dynamic scheduling that encourages adaptation."""
         
         if self.reward_mode == "makespan_increment":
-            # Use SAME reward structure as successful environments
-            if previous_makespan is not None and current_makespan is not None:
-                makespan_increment = current_makespan - previous_makespan
-                reward = -makespan_increment  # Negative increment
+            # Simplified reward: focus on makespan increment like successful environments
+            makespan_increment = current_time - previous_time
+            reward = -makespan_increment  # Primary objective: minimize makespan growth
+            
+            # Small penalty for idle time to encourage efficiency
+            reward -= idle_time * 0.1
+            
+            # Bonus for utilizing newly arrived jobs (dynamic advantage)
+            if num_new_arrivals > 0:
+                reward += 2.0 * num_new_arrivals  # Reduced from 5.0 for stability
+            
+            # Completion bonus
+            if done:
+                reward += 50.0  # Consistent with other environments
+            
+            return reward
+            
+        elif self.reward_mode == "makespan_minimization":
+            # Simple makespan-focused reward
+            reward = -proc_time  # Encourage shorter operations
+            
+            if done:
+                reward += max(0, 500.0 / current_time) if current_time > 0 else 100.0
+            
+            return reward
+            
+        elif self.reward_mode == "combined_makespan_utilization":
+            """
+            ENHANCED Combined reward mode that balances makespan minimization with machine utilization.
+            This is the recommended mode for dynamic scheduling problems.
+            
+            Key improvements for dynamic scheduling:
+            1. Stronger machine utilization penalties
+            2. Better future-aware scheduling incentives  
+            3. Dynamic adaptation bonuses
+            4. Load balancing rewards
+            """
+            reward = 0.0
+            
+            # 1. Makespan increment penalty (primary objective)
+            makespan_increment = current_time - previous_time
+            reward -= makespan_increment * 3.0  # INCREASED penalty for time progression
+            
+            # 2. ENHANCED Machine utilization rewards (critical for reducing empty spaces)
+            reward -= idle_time * 5.0  # STRONGER penalty for idle time
+            reward += 3.0  # Base reward for making progress
+            
+            # 3. Processing efficiency incentives
+            reward -= proc_time * 0.2  # Slight penalty for longer operations
+            
+            # 4. ENHANCED Dynamic adaptation bonuses
+            if num_new_arrivals > 0:
+                # Strong bonus for immediately utilizing newly arrived jobs
+                reward += num_new_arrivals * 12.0  # INCREASED bonus
                 
-                # Small bonus for utilizing newly arrived jobs (dynamic advantage)
-                if num_new_arrivals > 0:
-                    reward += 5.0 * num_new_arrivals
+                # Extra bonus if we schedule new jobs on currently idle machines
+                current_machine_loads = [max(0, self.machine_next_free[m] - current_time) for m in self.machines]
+                idle_machines = sum(1 for load in current_machine_loads if load <= 0.1)
+                if idle_machines > 0:
+                    reward += idle_machines * 5.0  # INCREASED bonus for using idle machines
+            
+            # 5. ENHANCED Load balancing incentive (reduce empty spaces)
+            machine_loads = [self.machine_next_free[m] for m in self.machines]
+            if len(machine_loads) > 1 and max(machine_loads) > 0:
+                load_std = np.std(machine_loads)
+                load_mean = np.mean(machine_loads)
+                if load_mean > 0:
+                    load_balance_ratio = 1.0 - (load_std / load_mean)
+                    reward += load_balance_ratio * 4.0  # INCREASED load balancing reward
+            
+            # 6. ENHANCED Future-aware scheduling
+            if self.next_arrival_events:
+                next_arrival_time = self.next_arrival_events[0][0]
+                time_to_next_arrival = next_arrival_time - current_time
                 
-                # Add completion bonus
-                if done:
-                    reward += 50.0
+                # Bonus for keeping machines available for upcoming arrivals
+                if 0 < time_to_next_arrival <= 10.0:
+                    available_machines = sum(1 for m in self.machines 
+                                           if self.machine_next_free[m] <= current_time + 2.0)
+                    reward += available_machines * 3.0  # INCREASED future-awareness bonus
+                
+                # STRONGER penalty for creating long idle periods when more jobs are coming
+                if idle_time > 3.0 and time_to_next_arrival > idle_time:
+                    reward -= 5.0  # INCREASED penalty for poor timing decisions
                     
-                return reward
-            else:
-                return -proc_time
-        else:
-            # Default reward function matching successful environments
+                # NEW: Bonus for scheduling operations that finish close to next arrival
+                if 0 < time_to_next_arrival <= proc_time + 2.0:
+                    reward += 2.0  # Reward for good timing coordination
+            
+            # 7. Job completion efficiency
+            if self.next_operation[job_id] >= len(self.jobs[job_id]):
+                # Job completed - bonus for quick completion
+                job_arrival_time = self.arrival_times.get(job_id, 0.0)
+                job_flow_time = current_time - job_arrival_time
+                if job_flow_time > 0:
+                    flow_time_bonus = min(20.0 / job_flow_time, 10.0)  # INCREASED flow time bonus
+                    reward += flow_time_bonus
+            
+            # 8. ENHANCED Final completion rewards
+            if done:
+                # Base completion bonus
+                reward += 200.0  # INCREASED completion bonus
+                
+                # Makespan efficiency bonus
+                if current_time > 0:
+                    makespan_bonus = min(400.0 / current_time, 100.0)  # INCREASED makespan bonus
+                    reward += makespan_bonus
+                
+                # ENHANCED Machine utilization bonus
+                total_workload = sum(self.machine_workload.values())
+                total_capacity = current_time * len(self.machines)
+                if total_capacity > 0:
+                    utilization = total_workload / total_capacity
+                    reward += utilization * 100.0  # INCREASED utilization bonus
+                
+                # ENHANCED Load balancing bonus
+                final_loads = [self.machine_next_free[m] for m in self.machines]
+                if len(final_loads) > 1 and max(final_loads) > 0:
+                    final_balance = 1.0 - (np.std(final_loads) / max(final_loads))
+                    reward += final_balance * 60.0  # INCREASED load balancing bonus
+                    
+                # NEW: Bonus for minimizing total machine idle time
+                total_machine_time = current_time * len(self.machines)
+                total_idle = total_machine_time - total_workload
+                if total_machine_time > 0:
+                    idle_ratio = total_idle / total_machine_time
+                    idle_efficiency_bonus = (1.0 - idle_ratio) * 80.0
+                    reward += idle_efficiency_bonus
+            
+            return reward
+            
+        else:  # Default basic reward
             reward = 10.0 - proc_time * 0.1 - idle_time
             if done:
                 reward += 100.0
@@ -610,10 +725,10 @@ class PoissonDynamicFJSPEnv(gym.Env):
         Simplified observation similar to successful PerfectKnowledgeFJSPEnv.
         Focus on essential information without over-complication.
         """
-        norm_factor = max(self.current_makespan, 1.0)
+        norm_factor = max(self.current_time, 1.0)
         obs = []
         
-        # Machine availability (normalized by current makespan)
+        # Machine availability (normalized by current time)
         for m in self.machines:
             value = float(self.machine_next_free.get(m, 0.0)) / norm_factor
             obs.append(max(0.0, min(1.0, value)))
@@ -643,9 +758,9 @@ class PoissonDynamicFJSPEnv(gym.Env):
             else:
                 obs.append(0.0)  # Job not yet arrived
             
-        # Current makespan (normalized)
-        makespan_norm = float(self.current_makespan) / 100.0  # Assume max makespan around 100
-        obs.append(max(0.0, min(1.0, makespan_norm)))
+        # Current time (normalized)
+        time_norm = float(self.current_time) / 100.0  # Assume max time around 100
+        obs.append(max(0.0, min(1.0, time_norm)))
         
         # Pad or truncate to match observation space
         target_size = self.observation_space.shape[0]
@@ -688,7 +803,7 @@ class PoissonDynamicFJSPEnv(gym.Env):
     def render(self, mode='human'):
         """Render the current state (optional)."""
         if mode == 'human':
-            print(f"\n=== Time: {self.current_makespan:.2f} ===")
+            print(f"\n=== Time: {self.current_time:.2f} ===")
             print(f"Arrived jobs: {sorted(self.arrived_jobs)}")
             print(f"Completed operations: {self.operations_scheduled}")
             print(f"Machine status:")
@@ -1475,7 +1590,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
         n_steps=2048,              # Match PerfectKnowledgeFJSPEnv  
         batch_size=128,            # Match PerfectKnowledgeFJSPEnv
         n_epochs=10,               # Match PerfectKnowledgeFJSPEnv
-        gamma=1,                   # Match PerfectKnowledgeFJSPEnv
+        gamma=0.99,                # Match PerfectKnowledgeFJSPEnv
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
@@ -1845,19 +1960,21 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
         reward_mode=reward_mode
     )
     
-    # Create ActionMasker wrapper
-    test_env = ActionMasker(test_env, mask_fn)
-    
     # Override with fixed arrival times
-    test_env.env.job_arrival_times = arrival_times.copy()
+    test_env.arrival_times = arrival_times.copy()
+    test_env.next_arrival_events = [(time, job_id) for job_id, time in arrival_times.items() if time > 0]
+    test_env.next_arrival_events.sort(key=lambda x: x[0])
     
     obs, _ = test_env.reset()
     
     # Re-override after reset
-    test_env.env.job_arrival_times = arrival_times.copy()
-    test_env.env.arrived_jobs = {job_id for job_id, arr_time in arrival_times.items() if arr_time <= 0}
+    test_env.arrival_times = arrival_times.copy()
+    test_env.next_arrival_events = [(time, job_id) for job_id, time in arrival_times.items() if time > 0]
+    test_env.next_arrival_events.sort(key=lambda x: x[0])
+    test_env.arrived_jobs = {job_id for job_id, arr_time in arrival_times.items() if arr_time <= 0}
     
-    print(f"  Dynamic RL initial jobs: {test_env.env.arrived_jobs}")
+    print(f"  Dynamic RL initial jobs: {test_env.arrived_jobs}")
+    print(f"  Dynamic RL future arrivals: {test_env.next_arrival_events}")
     
     step_count = 0
     invalid_actions = 0
@@ -1878,11 +1995,11 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
         if done or truncated:
             break
     
-    makespan = test_env.env.current_makespan
+    makespan = test_env.current_time
     
     # Add debug info about which jobs were scheduled
     scheduled_jobs = set()
-    for machine_ops in test_env.env.schedule.values():
+    for machine_ops in test_env.schedule.values():
         for op_data in machine_ops:
             if len(op_data) >= 3:
                 job_op = op_data[0]
@@ -1894,7 +2011,7 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
                         pass
     print(f"  Dynamic RL scheduled jobs: {sorted(scheduled_jobs)}")
     
-    return makespan, test_env.env.schedule
+    return makespan, test_env.schedule
 
 
 def evaluate_perfect_knowledge_on_scenario(perfect_model, jobs_data, machine_list, arrival_times, reward_mode="makespan_increment"):
@@ -1947,194 +2064,10 @@ def evaluate_perfect_knowledge_on_scenario(perfect_model, jobs_data, machine_lis
     return makespan, test_env.env.schedule
 
 
-
-
-
-def simple_list_scheduling(jobs_data, machine_list, arrival_times, rule):
-    """
-    Correct list scheduling implementation for FJSP with proper dispatching rules.
-    """
-    machine_next_free = {m: 0.0 for m in machine_list}
-    job_next_op = {job_id: 0 for job_id in jobs_data.keys()}
-    job_op_end_times = {job_id: [0.0] * len(jobs_data[job_id]) for job_id in jobs_data.keys()}
-    schedule = {m: [] for m in machine_list}
+def spt_heuristic_poisson(jobs_data, machine_list, arrival_times):
+    """SPT (Shortest Processing Time) heuristic for dynamic scheduling."""
+    print(f"  SPT Heuristic using arrival times: {arrival_times}")
     
-    completed_operations = 0
-    total_operations = sum(len(ops) for ops in jobs_data.values())
-    sim_time = 0.0
-    
-    while completed_operations < total_operations:
-        # Find ready operations
-        ready_operations = []
-        
-        for job_id in jobs_data.keys():
-            if job_next_op[job_id] < len(jobs_data[job_id]):  # Job not finished
-                op_idx = job_next_op[job_id]
-                
-                # Check if job has arrived and previous operation is complete
-                job_ready_time = arrival_times[job_id]
-                if op_idx > 0:
-                    job_ready_time = max(job_ready_time, job_op_end_times[job_id][op_idx - 1])
-                
-                if sim_time >= job_ready_time:
-                    op_data = jobs_data[job_id][op_idx]
-                    
-                    # Find best machine assignment (SPT for machine selection)
-                    best_machine = min(op_data['proc_times'].keys(), 
-                                     key=lambda m: op_data['proc_times'][m])
-                    proc_time = op_data['proc_times'][best_machine]
-                    
-                    ready_operations.append({
-                        'job_id': job_id,
-                        'op_idx': op_idx,
-                        'machine': best_machine,
-                        'proc_time': proc_time,
-                        'arrival_time': arrival_times[job_id],
-                        'job_ready_time': job_ready_time
-                    })
-        
-        if not ready_operations:
-            # Advance time to next event
-            next_time = float('inf')
-            for job_id in jobs_data.keys():
-                if job_next_op[job_id] < len(jobs_data[job_id]):
-                    op_idx = job_next_op[job_id]
-                    job_ready_time = arrival_times[job_id]
-                    if op_idx > 0:
-                        job_ready_time = max(job_ready_time, job_op_end_times[job_id][op_idx - 1])
-                    next_time = min(next_time, job_ready_time)
-            
-            if next_time == float('inf'):
-                break
-            sim_time = next_time
-            continue
-        
-        # Select operation based on dispatching rule
-        if rule == "FIFO":
-            selected_op = min(ready_operations, key=lambda x: (x['arrival_time'], x['job_id'], x['op_idx']))
-        elif rule == "LIFO":
-            selected_op = max(ready_operations, key=lambda x: (x['arrival_time'], x['job_id'], x['op_idx']))
-        elif rule == "SPT":
-            selected_op = min(ready_operations, key=lambda x: (x['proc_time'], x['arrival_time'], x['job_id']))
-        elif rule == "LPT":
-            selected_op = max(ready_operations, key=lambda x: (x['proc_time'], -x['arrival_time'], -x['job_id']))
-        elif rule == "EDD":
-            def due_date(op):
-                total_work = sum(min(jobs_data[op['job_id']][i]['proc_times'].values()) 
-                               for i in range(len(jobs_data[op['job_id']])))
-                return op['arrival_time'] + total_work * 1.5
-            selected_op = min(ready_operations, key=lambda x: (due_date(x), x['arrival_time'], x['job_id']))
-        else:
-            selected_op = ready_operations[0]  # Default to first
-        
-        # Schedule the selected operation
-        job_id = selected_op['job_id']
-        op_idx = selected_op['op_idx']
-        machine = selected_op['machine']
-        proc_time = selected_op['proc_time']
-        
-        # Calculate start time
-        machine_avail = machine_next_free[machine]
-        job_ready = selected_op['job_ready_time']
-        start_time = max(sim_time, machine_avail, job_ready)
-        end_time = start_time + proc_time
-        
-        # Update state
-        machine_next_free[machine] = end_time
-        job_op_end_times[job_id][op_idx] = end_time
-        job_next_op[job_id] += 1
-        schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
-        
-        completed_operations += 1
-        sim_time = start_time  # Move simulation time forward
-    
-    makespan = max(machine_next_free.values()) if machine_next_free else 0
-    return makespan, schedule
-
-
-def run_heuristic_comparison(jobs_data, machine_list, arrival_times):
-    """
-    Compare different dispatching rules and return the best one.
-    Tests FIFO, LIFO, SPT, LPT, and EDD heuristics.
-    """
-    heuristics = {
-        'FIFO': lambda ops: fifo_heuristic(jobs_data, machine_list, arrival_times),
-        'LIFO': lambda ops: lifo_heuristic(jobs_data, machine_list, arrival_times), 
-        'SPT': lambda ops: spt_heuristic_simple(jobs_data, machine_list, arrival_times),
-        'LPT': lambda ops: lpt_heuristic(jobs_data, machine_list, arrival_times),
-        'EDD': lambda ops: edd_heuristic(jobs_data, machine_list, arrival_times)
-    }
-    
-    results = {}
-    for name, heuristic_func in heuristics.items():
-        try:
-            makespan, schedule = heuristic_func(None)
-            results[name] = (makespan, schedule)
-            print(f"    {name} completed with makespan: {makespan:.2f}")
-        except Exception as e:
-            print(f"    {name} failed: {e}")
-            results[name] = (float('inf'), {})
-    
-    # Find best heuristic
-    valid_results = {k: v for k, v in results.items() if v[0] != float('inf')}
-    if not valid_results:
-        print("    All heuristics failed! Using fallback.")
-        return 999.0, {m: [] for m in machine_list}
-    
-    best_name = min(valid_results.keys(), key=lambda k: valid_results[k][0])
-    best_makespan, best_schedule = valid_results[best_name]
-    
-    print(f"  Heuristic comparison results:")
-    for name, (makespan, _) in results.items():
-        if makespan == float('inf'):
-            print(f"    {name}: FAILED")
-        else:
-            status = "✅ BEST" if name == best_name else ""
-            print(f"    {name}: {makespan:.2f} {status}")
-    
-    print(f"  Selected: {best_name} Heuristic (makespan: {best_makespan:.2f})")
-    return best_makespan, best_schedule
-
-
-
-
-
-
-
-
-def fifo_heuristic(jobs_data, machine_list, arrival_times):
-    """FIFO (First In First Out) - Process jobs in arrival order."""
-    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "FIFO")
-
-
-def lifo_heuristic(jobs_data, machine_list, arrival_times):
-    """LIFO (Last In First Out) - Process newest jobs first.""" 
-    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "LIFO")
-
-
-def spt_heuristic_simple(jobs_data, machine_list, arrival_times):
-    """SPT (Shortest Processing Time) - Process shortest operations first."""
-    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "SPT")
-
-
-def lpt_heuristic(jobs_data, machine_list, arrival_times): 
-    """LPT (Longest Processing Time) - Process longest operations first."""
-    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "LPT")
-
-
-def edd_heuristic(jobs_data, machine_list, arrival_times):
-    """EDD (Earliest Due Date) - Simple version using job completion time estimates."""
-    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "EDD")
-
-
-def _generic_heuristic(jobs_data, machine_list, arrival_times, heuristic_name, priority_func):
-    """
-    Improved generic heuristic implementation for different dispatching rules.
-    
-    Args:
-        priority_func: Function that takes (job_id, op_idx, machine, proc_time) and returns priority value.
-                      Lower values = higher priority.
-    """
     machine_next_free = {m: 0.0 for m in machine_list}
     operation_end_times = {job_id: [0.0] * len(jobs_data[job_id]) for job_id in jobs_data}
     next_operation_for_job = {job_id: 0 for job_id in jobs_data}
@@ -2145,24 +2078,26 @@ def _generic_heuristic(jobs_data, machine_list, arrival_times, heuristic_name, p
     total_operations = sum(len(ops) for ops in jobs_data.values())
     sim_time = 0.0
     
+    print(f"  SPT initial jobs: {arrived_jobs}")
+    future_arrivals = {job_id: arr_time for job_id, arr_time in arrival_times.items() if arr_time > 0}
+    print(f"  SPT future arrivals: {future_arrivals}")
+    
     while operations_scheduled < total_operations:
-        # Update arrivals based on current simulation time
+        # Update arrivals
+        new_arrivals = []
         for job_id, arr_time in arrival_times.items():
             if job_id not in arrived_jobs and arr_time <= sim_time:
                 arrived_jobs.add(job_id)
+                new_arrivals.append(job_id)
         
-        # Collect available operations (with all machine options)
+        # Collect available operations
         available_ops = []
         for job_id in arrived_jobs:
             next_op = next_operation_for_job[job_id]
             if next_op < len(jobs_data[job_id]):
                 # Check if job is ready (previous operation completed)
-                job_ready_time = (operation_end_times[job_id][next_op - 1] 
-                                if next_op > 0 else arrival_times[job_id])
-                
-                if job_ready_time <= sim_time:
+                if next_op == 0 or operation_end_times[job_id][next_op - 1] <= sim_time:
                     op_data = jobs_data[job_id][next_op]
-                    # Consider ALL compatible machines, not just the best one
                     for machine, proc_time in op_data['proc_times'].items():
                         available_ops.append((job_id, next_op, machine, proc_time))
         
@@ -2194,38 +2129,30 @@ def _generic_heuristic(jobs_data, machine_list, arrival_times, heuristic_name, p
                 break
             continue
         
-        # Enhanced priority function that considers machine availability
-        def enhanced_priority(op_data):
+        # Apply improved SPT with machine utilization priority
+        # Sort by multiple criteria: 1) processing time, 2) machine availability, 3) load balancing
+        def spt_priority(op_data):
             job_id, op_idx, machine, proc_time = op_data
-            
-            # Base priority from the heuristic rule
-            base_priority = priority_func(op_data)
-            
-            # Machine availability factor - prefer machines that are available sooner
             machine_available_time = machine_next_free[machine]
-            job_ready_time = (operation_end_times[job_id][op_idx - 1] 
-                            if op_idx > 0 else arrival_times[job_id])
+            job_ready_time = operation_end_times[job_id][op_idx - 1] if op_idx > 0 else arrival_times[job_id]
             
-            earliest_start = max(machine_available_time, job_ready_time, sim_time)
+            start_time = max(machine_available_time, job_ready_time, sim_time)
+            idle_time = max(0, start_time - machine_available_time)
             
-            # Combine base priority with machine availability
-            # For SPT/LPT: mainly processing time, with slight preference for available machines
-            # For FIFO/LIFO: mainly arrival order, with machine availability as tiebreaker
-            if heuristic_name in ['SPT', 'LPT']:
-                # Processing time is primary, machine availability is secondary
-                return base_priority + (earliest_start - sim_time) * 0.1
-            else:  # FIFO, LIFO
-                # Arrival order is primary, processing time and availability are secondary
-                return base_priority + proc_time * 0.1 + (earliest_start - sim_time) * 0.05
+            # Multi-criteria priority: prefer short operations on immediately available machines
+            priority = (
+                proc_time * 1.0,          # Primary: shortest processing time
+                idle_time * 0.5,          # Secondary: minimize idle time
+                machine_available_time * 0.1  # Tertiary: prefer available machines
+            )
+            return sum(priority)
         
-        # Sort operations by enhanced priority (lower is better)
-        available_ops.sort(key=enhanced_priority)
+        available_ops.sort(key=spt_priority)
         job_id, op_idx, machine, proc_time = available_ops[0]
         
         # Calculate timing
         machine_available_time = machine_next_free[machine]
-        job_ready_time = (operation_end_times[job_id][op_idx - 1] 
-                         if op_idx > 0 else arrival_times[job_id])
+        job_ready_time = operation_end_times[job_id][op_idx - 1] if op_idx > 0 else arrival_times[job_id]
         
         start_time = max(machine_available_time, job_ready_time, sim_time)
         end_time = start_time + proc_time
@@ -2242,16 +2169,21 @@ def _generic_heuristic(jobs_data, machine_list, arrival_times, heuristic_name, p
     
     makespan = max(machine_next_free.values()) if machine_next_free else 0
     
+    # Add debug info about which jobs were scheduled
+    scheduled_jobs = set()
+    for machine_ops in schedule.values():
+        for op_data in machine_ops:
+            if len(op_data) >= 3:
+                job_op = op_data[0]
+                if 'J' in job_op:
+                    try:
+                        job_num = int(job_op.split('J')[1].split('-')[0])
+                        scheduled_jobs.add(job_num)
+                    except:
+                        pass
+    print(f"  SPT Heuristic scheduled jobs: {sorted(scheduled_jobs)}")
+    
     return makespan, schedule
-
-
-def spt_heuristic_poisson(jobs_data, machine_list, arrival_times):
-    """
-    Run comparison of simple dispatching heuristics and return the best one.
-    Uses SPT for machine selection and compares FIFO, LIFO, SPT, LPT for job sequencing.
-    """
-    print(f"  Comparing FIFO, LIFO, SPT, LPT heuristics with arrival times: {arrival_times}")
-    return run_heuristic_comparison(jobs_data, machine_list, arrival_times)
 
 
 def milp_optimal_scheduler(jobs_data, machine_list, arrival_times):
@@ -2452,7 +2384,7 @@ def diagnose_performance_similarity(perfect_makespan, dynamic_makespan, static_m
         ("Perfect Knowledge RL", perfect_makespan),
         ("Dynamic RL", dynamic_makespan), 
         ("Static RL", static_makespan),
-        ("Best Heuristic", spt_makespan)
+        ("SPT Heuristic", spt_makespan)
     ]
     
     makespans = [makespan for _, makespan in results]
@@ -2694,8 +2626,8 @@ def main():
     # Define static arrivals for plotting (all jobs at t=0)
     static_arrivals = {job_id: 0.0 for job_id in ENHANCED_JOBS_DATA.keys()}
     
-    # Best Heuristic (from FIFO, LIFO, SPT, LPT comparison)
-    print("Evaluating Best Heuristic (comparing FIFO, LIFO, SPT, LPT)...")
+    # SPT Heuristic for comparison
+    print("Evaluating SPT Heuristic...")
     spt_makespan, spt_schedule = spt_heuristic_poisson(ENHANCED_JOBS_DATA, MACHINE_LIST, first_scenario_arrivals)
     
     # MILP Optimal Solution (Benchmark)
@@ -2710,7 +2642,7 @@ def main():
     print(f"Dynamic RL (Poisson)      - Makespan: {dynamic_makespan:.2f}")  
     print(f"Static RL (on dynamic)    - Makespan: {static_dynamic_makespan:.2f}")
     print(f"Static RL (on static)     - Makespan: {static_static_makespan:.2f}")
-    print(f"Best Heuristic            - Makespan: {spt_makespan:.2f}")
+    print(f"SPT Heuristic             - Makespan: {spt_makespan:.2f}")
     
     print("\nPerformance Ranking:")
     results = [
@@ -2719,7 +2651,7 @@ def main():
         ("Dynamic RL", dynamic_makespan), 
         ("Static RL (dynamic)", static_dynamic_makespan),
         ("Static RL (static)", static_static_makespan),
-        ("Best Heuristic", spt_makespan)
+        ("SPT Heuristic", spt_makespan)
     ]
     results.sort(key=lambda x: x[1])
     for i, (method, makespan) in enumerate(results, 1):
@@ -2742,7 +2674,7 @@ def main():
             "Dynamic RL": dynamic_makespan,
             "Static RL (dynamic)": static_dynamic_makespan,
             "Static RL (static)": static_static_makespan,
-            "Best Heuristic": spt_makespan
+            "SPT Heuristic": spt_makespan
         }
         regret_results = calculate_regret_analysis(milp_makespan, methods_results)
     
@@ -2780,13 +2712,13 @@ def main():
         gap = ((static_static_makespan - static_dynamic_makespan) / static_static_makespan) * 100
         print(f"⚠️ Unexpected: Static RL performs {gap:.1f}% worse on static scenarios")
     
-    # Dynamic RL vs Best Heuristic
+    # Dynamic RL vs SPT
     if dynamic_makespan < spt_makespan:
         improvement = ((spt_makespan - dynamic_makespan) / spt_makespan) * 100
-        print(f"✓ Dynamic RL outperforms Best Heuristic by {improvement:.1f}%")
+        print(f"✓ Dynamic RL outperforms SPT Heuristic by {improvement:.1f}%")
     else:
         gap = ((dynamic_makespan - spt_makespan) / spt_makespan) * 100
-        print(f"✗ Dynamic RL underperforms Best Heuristic by {gap:.1f}%")
+        print(f"✗ Dynamic RL underperforms SPT Heuristic by {gap:.1f}%")
     
     # Step 7: Generate Gantt Charts for Comparison
     print(f"\n7. GANTT CHART COMPARISON")
@@ -2797,7 +2729,7 @@ def main():
     fig, axes = plt.subplots(num_plots, 1, figsize=(18, num_plots * 3.5))
     
     if milp_makespan != float('inf'):
-        fig.suptitle('Main Scheduling Comparison: MILP vs Perfect Knowledge vs Dynamic vs Static RL vs Best Heuristic\n' + 
+        fig.suptitle('Main Scheduling Comparison: MILP vs Perfect Knowledge vs Dynamic vs Static RL vs SPT\n' + 
                      f'Test Scenario: Jobs 0-2 at t=0, Jobs 3-6 via Poisson arrivals\n' +
                      f'Static RL evaluated on dynamic scenario with arrivals', 
                      fontsize=16, fontweight='bold')
@@ -2806,10 +2738,10 @@ def main():
             {'schedule': perfect_schedule, 'makespan': perfect_makespan, 'title': 'Perfect Knowledge RL', 'arrival_times': first_scenario_arrivals},
             {'schedule': dynamic_schedule, 'makespan': dynamic_makespan, 'title': 'Dynamic RL', 'arrival_times': first_scenario_arrivals},
             {'schedule': static_dynamic_schedule, 'makespan': static_dynamic_makespan, 'title': 'Static RL (on dynamic scenario)', 'arrival_times': first_scenario_arrivals},
-            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'Best Heuristic', 'arrival_times': first_scenario_arrivals}
+            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'SPT Heuristic', 'arrival_times': first_scenario_arrivals}
         ]
     else:
-        fig.suptitle('Main Scheduling Comparison: Perfect Knowledge vs Dynamic vs Static RL vs Best Heuristic\n' + 
+        fig.suptitle('Main Scheduling Comparison: Perfect Knowledge vs Dynamic vs Static RL vs SPT\n' + 
                      f'Test Scenario: Jobs 0-2 at t=0, Jobs 3-6 via Poisson arrivals\n' +
                      f'Static RL evaluated on dynamic scenario with arrivals', 
                      fontsize=16, fontweight='bold')
@@ -2817,21 +2749,10 @@ def main():
             {'schedule': perfect_schedule, 'makespan': perfect_makespan, 'title': 'Perfect Knowledge RL', 'arrival_times': first_scenario_arrivals},
             {'schedule': dynamic_schedule, 'makespan': dynamic_makespan, 'title': 'Dynamic RL', 'arrival_times': first_scenario_arrivals},
             {'schedule': static_dynamic_schedule, 'makespan': static_dynamic_makespan, 'title': 'Static RL (on dynamic scenario)', 'arrival_times': first_scenario_arrivals},
-            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'Best Heuristic', 'arrival_times': first_scenario_arrivals}
+            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'SPT Heuristic', 'arrival_times': first_scenario_arrivals}
         ]
     
     colors = plt.cm.tab20.colors
-    
-    # Calculate the maximum makespan across all schedules for consistent scaling
-    max_makespan_for_scaling = 0
-    for data in schedules_data:
-        schedule = data['schedule']
-        if schedule and any(len(ops) > 0 for ops in schedule.values()):
-            schedule_max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
-            max_makespan_for_scaling = max(max_makespan_for_scaling, schedule_max_time)
-    
-    # Add some padding (10%) for visual clarity
-    consistent_x_limit = max_makespan_for_scaling * 1.1 if max_makespan_for_scaling > 0 else 100
     
     for plot_idx, data in enumerate(schedules_data):
         schedule = data['schedule']
@@ -2845,9 +2766,6 @@ def main():
             ax.text(0.5, 0.5, 'No valid schedule', ha='center', va='center', 
                    transform=ax.transAxes, fontsize=14)
             ax.set_title(f"{title} - No Solution")
-            # Still apply consistent scaling even for failed schedules
-            ax.set_xlim(0, consistent_x_limit)
-            ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)
             continue
         
         # Plot operations for each machine
@@ -2882,7 +2800,7 @@ def main():
         if arrival_times:
             arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
             for job_id, arrival_time in arrival_times.items():
-                if arrival_time > 0 and arrival_time < consistent_x_limit:  # Only show arrows for jobs that don't start at t=0 and arrive within time horizon
+                if arrival_time > 0 and arrival_time < 200:  # Only show arrows for jobs that don't start at t=0 and arrive within time horizon
                     # Draw vertical line for arrival
                     ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=2)
                     
@@ -2897,13 +2815,17 @@ def main():
         # Formatting
         ax.set_yticks(range(len(MACHINE_LIST)))
         ax.set_yticklabels(MACHINE_LIST)
-        ax.set_xlabel("Time" if plot_idx == len(schedules_data)-1 else "")
+        ax.set_xlabel("Time" if plot_idx == 2 else "")
         ax.set_ylabel("Machines")
         ax.set_title(f"{title} (Makespan: {makespan:.2f})", fontweight='bold')
         ax.grid(True, alpha=0.3)
         
-        # Apply consistent x-axis limits across all subplots
-        ax.set_xlim(0, consistent_x_limit)
+        # Set consistent x-axis limits with space for arrows
+        if schedule and any(len(ops) > 0 for ops in schedule.values()):
+            max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+            ax.set_xlim(0, max_time * 1.05)
+        else:
+            ax.set_xlim(0, 100)  # Default range if no schedule
         ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)  # Extra space for arrival arrows and labels
     
     # Add legend
@@ -2946,16 +2868,6 @@ def main():
         {'schedule': static_static_schedule, 'makespan': static_static_makespan, 'title': 'Static RL on Static Scenario (All jobs at t=0)', 'arrival_times': static_arrivals}
     ]
     
-    # Calculate consistent scaling for static comparison plots
-    static_max_makespan = 0
-    for data in static_comparison_data:
-        schedule = data['schedule']
-        if schedule and any(len(ops) > 0 for ops in schedule.values()):
-            schedule_max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
-            static_max_makespan = max(static_max_makespan, schedule_max_time)
-    
-    static_consistent_x_limit = static_max_makespan * 1.1 if static_max_makespan > 0 else 100
-    
     for plot_idx, data in enumerate(static_comparison_data):
         schedule = data['schedule']
         makespan = data['makespan']
@@ -2968,9 +2880,6 @@ def main():
             ax.text(0.5, 0.5, 'No valid schedule', ha='center', va='center', 
                    transform=ax.transAxes, fontsize=14)
             ax.set_title(f"{title} - No Solution")
-            # Still apply consistent scaling even for failed schedules
-            ax.set_xlim(0, static_consistent_x_limit)
-            ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)
             continue
         
         # Plot operations for each machine
@@ -3005,7 +2914,7 @@ def main():
         if plot_idx == 0 and arrival_times:  # Only for dynamic scenario
             arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
             for job_id, arrival_time in arrival_times.items():
-                if arrival_time > 0 and arrival_time < static_consistent_x_limit:  # Only show arrows for jobs that don't start at t=0
+                if arrival_time > 0 and arrival_time < 200:  # Only show arrows for jobs that don't start at t=0
                     # Draw vertical line for arrival
                     ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=2)
                     
@@ -3025,8 +2934,12 @@ def main():
         ax.set_title(f"{title} (Makespan: {makespan:.2f})", fontweight='bold')
         ax.grid(True, alpha=0.3)
         
-        # Apply consistent x-axis limits across both static comparison plots
-        ax.set_xlim(0, static_consistent_x_limit)
+        # Set consistent x-axis limits
+        if schedule and any(len(ops) > 0 for ops in schedule.values()):
+            max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+            ax.set_xlim(0, max_time * 1.05)
+        else:
+            ax.set_xlim(0, 100)  # Default range if no schedule
         ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)  # Extra space for arrival arrows and labels
     
     # Add legend for static comparison

@@ -3005,7 +3005,7 @@ def main():
         if plot_idx == 0 and arrival_times:  # Only for dynamic scenario
             arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
             for job_id, arrival_time in arrival_times.items():
-                if arrival_time > 0 and arrival_time < static_consistent_x_limit:  # Only show arrows for jobs that don't start at t=0
+                if arrival_time > 0 and arrival_time < 200:  # Only show arrows for jobs that don't start at t=0
                     # Draw vertical line for arrival
                     ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=2)
                     

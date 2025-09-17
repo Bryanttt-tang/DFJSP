@@ -3005,7 +3005,7 @@ def main():
         if plot_idx == 0 and arrival_times:  # Only for dynamic scenario
             arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
             for job_id, arrival_time in arrival_times.items():
-                if arrival_time > 0 and arrival_time < static_consistent_x_limit:  # Only show arrows for jobs that don't start at t=0
+                if arrival_time > 0 and arrival_time < 200:  # Only show arrows for jobs that don't start at t=0
                     # Draw vertical line for arrival
                     ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=2)
                     
@@ -3025,8 +3025,12 @@ def main():
         ax.set_title(f"{title} (Makespan: {makespan:.2f})", fontweight='bold')
         ax.grid(True, alpha=0.3)
         
-        # Apply consistent x-axis limits across both static comparison plots
-        ax.set_xlim(0, static_consistent_x_limit)
+        # Set consistent x-axis limits
+        if schedule and any(len(ops) > 0 for ops in schedule.values()):
+            max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+            ax.set_xlim(0, max_time * 1.05)
+        else:
+            ax.set_xlim(0, 100)  # Default range if no schedule
         ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)  # Extra space for arrival arrows and labels
     
     # Add legend for static comparison

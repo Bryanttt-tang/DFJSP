@@ -27,6 +27,40 @@ SIMPLE_JOBS_DATA = {
 SIMPLE_MACHINES = ['M1', 'M2', 'M3']
 SIMPLE_ARRIVALS = {1: 0, 2: 0}  # all arrive at 0
 
+LARGER_JOBS_DATA = {
+    1: [
+        {'proc_times': {'M1': 2, 'M2': 4, 'M3': 3, 'M4': 5}},
+        {'proc_times': {'M1': 3, 'M2': 2, 'M3': 4, 'M4': 6}},
+        {'proc_times': {'M1': 4, 'M2': 3, 'M3': 2, 'M4': 7}}
+    ],
+    2: [
+        {'proc_times': {'M1': 4, 'M2': 3, 'M3': 2, 'M4': 5}},
+        {'proc_times': {'M1': 2, 'M2': 3, 'M3': 4, 'M4': 6}},
+        {'proc_times': {'M1': 5, 'M2': 2, 'M3': 3, 'M4': 4}}
+    ],
+    3: [
+        {'proc_times': {'M1': 3, 'M2': 5, 'M3': 2, 'M4': 4}},
+        {'proc_times': {'M1': 4, 'M2': 2, 'M3': 5, 'M4': 3}},
+        {'proc_times': {'M1': 2, 'M2': 4, 'M3': 3, 'M4': 5}}
+    ],
+    4: [
+        {'proc_times': {'M1': 5, 'M2': 3, 'M3': 4, 'M4': 2}},
+        {'proc_times': {'M1': 3, 'M2': 4, 'M3': 2, 'M4': 5}},
+        {'proc_times': {'M1': 4, 'M2': 5, 'M3': 3, 'M4': 2}}
+    ],
+    5: [
+        {'proc_times': {'M1': 2, 'M2': 3, 'M3': 5, 'M4': 4}},
+        {'proc_times': {'M1': 5, 'M2': 2, 'M3': 4, 'M4': 3}},
+        {'proc_times': {'M1': 3, 'M2': 4, 'M3': 2, 'M4': 5}}
+    ]
+}
+LARGER_MACHINES = ['M1', 'M2', 'M3', 'M4']
+LARGER_ARRIVALS = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+
+SIMPLE_JOBS_DATA = LARGER_JOBS_DATA
+SIMPLE_MACHINES = LARGER_MACHINES
+SIMPLE_ARRIVALS = LARGER_ARRIVALS
+
 job_ids = list(SIMPLE_JOBS_DATA.keys())
 machines = SIMPLE_MACHINES[:]
 J = len(job_ids)
