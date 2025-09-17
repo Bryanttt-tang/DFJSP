@@ -1,0 +1,33 @@
+# Generated DFJSP instance for test2.py
+import collections
+
+jobs_data = collections.OrderedDict({
+    0: [
+        {'proc_times': {'M0': 7.85, 'M2': 8.07, 'M1': 2.15}},
+        {'proc_times': {'M2': 6.79, 'M0': 8.4, 'M1': 4.99}},
+    ],
+    1: [
+        {'proc_times': {'M2': 4.19, 'M0': 9.74, 'M1': 9.04}},
+        {'proc_times': {'M1': 5.2, 'M0': 1.39, 'M2': 2.39}},
+        {'proc_times': {'M1': 3.93, 'M0': 4.33, 'M2': 5.23}},
+        {'proc_times': {'M2': 5.28, 'M0': 3.04, 'M1': 7.03}},
+    ],
+    2: [
+        {'proc_times': {'M1': 7.14, 'M0': 2.26, 'M2': 2.8}},
+        {'proc_times': {'M0': 7.35, 'M1': 8.03, 'M2': 5.13}},
+        {'proc_times': {'M2': 2.03, 'M1': 7.02}},
+    ],
+    3: [
+        {'proc_times': {'M1': 6.03, 'M2': 3.74}},
+        {'proc_times': {'M1': 2.93, 'M0': 4.68}},
+    ],
+})
+
+machine_list = ['M0', 'M1', 'M2']
+
+job_arrival_times = {
+    0: 0.0,
+    1: 0.0,
+    2: 13.34,
+    3: 27.25,
+}
