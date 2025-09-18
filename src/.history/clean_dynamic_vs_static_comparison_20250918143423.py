@@ -1828,9 +1828,8 @@ def evaluate_perfect_knowledge_on_scenario(perfect_model, jobs_data, machine_lis
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     

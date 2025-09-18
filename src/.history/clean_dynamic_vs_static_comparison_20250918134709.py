@@ -1,4 +1,3 @@
-
 import numpy as np
 import random
 import matplotlib.pyplot as plt
@@ -12,30 +11,21 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from pulp import LpProblem, LpMinimize, LpVariable, lpSum, PULP_CBC_CMD
+from stable_baselines3.common.callbacks import BaseCallback
 
 # Set random seed for reproducibility
-GLOBAL_SEED = 42
-random.seed(GLOBAL_SEED)
-np.random.seed(GLOBAL_SEED)
-torch.manual_seed(GLOBAL_SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(GLOBAL_SEED)
-    torch.cuda.manual_seed_all(GLOBAL_SEED)
+random.seed(42)
+np.random.seed(42)
 
 # Global tracking for arrival time distribution analysis
 TRAINING_ARRIVAL_TIMES = []  # Track all arrival times during training
 TRAINING_EPISODE_COUNT = 0   # Track episode count
-DEBUG_EPISODE_ARRIVALS = []  # Track first 10 episodes' arrival details
 
-# Training metrics tracking
-TRAINING_METRICS = {
-    'episode_rewards': [],
-    'episode_lengths': [],
-    'action_entropy': [],
-    'policy_loss': [],
-    'value_loss': [],
-    'timesteps': []
-}
+# Global tracking for detailed episode analysis
+DETAILED_EPISODES = []       # Track first 10 episodes in detail
+TRAINING_REWARDS = []        # Track episode rewards
+TRAINING_RETURNS = []        # Track episode returns (cumulative rewards)
+TRAINING_MAKESPANS = []      # Track episode makespans
 
 # --- Expanded Job Data for Better Generalization ---
 # Exact dataset from test3_backup.py that achieved makespan=43 with dynamic RL
@@ -53,6 +43,568 @@ ENHANCED_JOBS_DATA = collections.OrderedDict({
 DETERMINISTIC_ARRIVAL_TIMES = {0: 0, 1: 0, 2: 0, 3: 8, 4: 12, 5: 16, 6: 20}
 
 MACHINE_LIST = ['M0', 'M1', 'M2']
+
+
+class TrainingProgressCallback(BaseCallback):
+    """Custom callback to track training progress and episode details."""
+    
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+        self.episode_returns = []
+        self.episode_makespans = []
+        self.episode_lengths = []
+    
+    def _on_step(self) -> bool:
+        # Track per-step information if needed
+        return True
+    
+    def _on_rollout_end(self) -> None:
+        """Called at the end of each rollout."""
+        global DETAILED_EPISODES, TRAINING_REWARDS, TRAINING_RETURNS, TRAINING_MAKESPANS
+        
+        # Extract episode information from infos
+        if hasattr(self.locals, 'infos') and self.locals['infos']:
+            for info in self.locals['infos']:
+                if 'episode' in info:
+                    episode_info = info['episode']
+                    episode_return = episode_info['r']
+                    episode_length = episode_info['l']
+                    
+                    TRAINING_RETURNS.append(episode_return)
+                    self.episode_returns.append(episode_return)
+                    self.episode_lengths.append(episode_length)
+                    
+                    # Try to get makespan from the environment
+                    if hasattr(self.training_env, 'envs') and len(self.training_env.envs) > 0:
+                        env = self.training_env.envs[0]
+                        if hasattr(env, 'current_makespan'):
+                            makespan = env.current_makespan
+                            TRAINING_MAKESPANS.append(makespan)
+                            self.episode_makespans.append(makespan)
+
+
+def visualize_job_arrivals_and_training():
+    """Create comprehensive visualizations for job arrivals and training progress."""
+    global DETAILED_EPISODES, TRAINING_RETURNS, TRAINING_MAKESPANS
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(20, 12))
+    
+    # 1. Job Arrival Patterns for First 10 Episodes (Top Left)
+    ax1 = plt.subplot(2, 3, 1)
+    if DETAILED_EPISODES:
+        colors = plt.cm.tab10.colors
+        for i, episode in enumerate(DETAILED_EPISODES[:10]):
+            episode_num = episode['episode']
+            arrivals = episode['arrival_times']
+            
+            # Plot arrival times as vertical lines
+            y_pos = episode_num
+            for job_id, arrival_time in arrivals.items():
+                if arrival_time > 0 and arrival_time < 200:  # Only plot meaningful arrivals
+                    ax1.scatter(arrival_time, y_pos, color=colors[job_id % len(colors)], 
+                              s=80, alpha=0.8, label=f'Job {job_id}' if i == 0 else "")
+                    ax1.text(arrival_time + 1, y_pos, f'J{job_id}', fontsize=8, 
+                           verticalalignment='center')
+        
+        ax1.set_xlabel('Arrival Time')
+        ax1.set_ylabel('Episode Number')
+        ax1.set_title('Dynamic Job Arrivals (First 10 Episodes)')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_ylim(0.5, 10.5)
+        if len(DETAILED_EPISODES) > 0:
+            max_arrival = max([max([t for t in ep['arrival_times'].values() if t < 200], default=0) 
+                             for ep in DETAILED_EPISODES[:10]], default=50)
+            ax1.set_xlim(0, max_arrival * 1.1)
+    
+    # 2. Episode Returns Over Time (Top Middle)
+    ax2 = plt.subplot(2, 3, 2)
+    if TRAINING_RETURNS:
+        episodes = range(1, len(TRAINING_RETURNS) + 1)
+        ax2.plot(episodes, TRAINING_RETURNS, 'b-', alpha=0.6, linewidth=1)
+        
+        # Add moving average
+        if len(TRAINING_RETURNS) > 10:
+            window = min(50, len(TRAINING_RETURNS) // 4)
+            moving_avg = np.convolve(TRAINING_RETURNS, np.ones(window)/window, mode='valid')
+            ax2.plot(episodes[window-1:], moving_avg, 'r-', linewidth=2, label=f'Moving Avg ({window})')
+            ax2.legend()
+        
+        ax2.set_xlabel('Episode')
+        ax2.set_ylabel('Episode Return')
+        ax2.set_title('Training Returns Over Time')
+        ax2.grid(True, alpha=0.3)
+    
+    # 3. Episode Makespans Over Time (Top Right)
+    ax3 = plt.subplot(2, 3, 3)
+    if TRAINING_MAKESPANS:
+        episodes = range(1, len(TRAINING_MAKESPANS) + 1)
+        ax3.plot(episodes, TRAINING_MAKESPANS, 'g-', alpha=0.6, linewidth=1)
+        
+        # Add moving average
+        if len(TRAINING_MAKESPANS) > 10:
+            window = min(50, len(TRAINING_MAKESPANS) // 4)
+            moving_avg = np.convolve(TRAINING_MAKESPANS, np.ones(window)/window, mode='valid')
+            ax3.plot(episodes[window-1:], moving_avg, 'orange', linewidth=2, label=f'Moving Avg ({window})')
+            ax3.legend()
+        
+        ax3.set_xlabel('Episode')
+        ax3.set_ylabel('Final Makespan')
+        ax3.set_title('Episode Makespans Over Time')
+        ax3.grid(True, alpha=0.3)
+    
+    # 4. Detailed Episode Analysis (Bottom Left)
+    ax4 = plt.subplot(2, 3, 4)
+    if DETAILED_EPISODES:
+        episode_nums = [ep['episode'] for ep in DETAILED_EPISODES[:10]]
+        episode_returns = [ep['episode_return'] for ep in DETAILED_EPISODES[:10]]
+        final_makespans = [ep['final_makespan'] for ep in DETAILED_EPISODES[:10]]
+        steps_taken = [ep['steps_taken'] for ep in DETAILED_EPISODES[:10]]
+        
+        # Create bar chart
+        x = np.arange(len(episode_nums))
+        width = 0.25
+        
+        ax4.bar(x - width, episode_returns, width, label='Episode Return', alpha=0.8)
+        ax4.bar(x, final_makespans, width, label='Final Makespan', alpha=0.8)
+        ax4.bar(x + width, [s/10 for s in steps_taken], width, label='Steps (÷10)', alpha=0.8)
+        
+        ax4.set_xlabel('Episode')
+        ax4.set_ylabel('Value')
+        ax4.set_title('First 10 Episodes - Detailed Metrics')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels([f'Ep {n}' for n in episode_nums])
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+    
+    # 5. Arrival Time Distribution (Bottom Middle)
+    ax5 = plt.subplot(2, 3, 5)
+    if TRAINING_ARRIVAL_TIMES:
+        valid_arrivals = [t for t in TRAINING_ARRIVAL_TIMES if 0 < t < 200]
+        if valid_arrivals:
+            ax5.hist(valid_arrivals, bins=20, alpha=0.7, color='skyblue', edgecolor='black')
+            ax5.axvline(np.mean(valid_arrivals), color='red', linestyle='--', 
+                       label=f'Mean: {np.mean(valid_arrivals):.1f}')
+            ax5.set_xlabel('Arrival Time')
+            ax5.set_ylabel('Frequency')
+            ax5.set_title('Distribution of Dynamic Job Arrivals')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+    
+    # 6. Reward vs Makespan Correlation (Bottom Right)
+    ax6 = plt.subplot(2, 3, 6)
+    if DETAILED_EPISODES and len(DETAILED_EPISODES) > 3:
+        returns = [ep['episode_return'] for ep in DETAILED_EPISODES[:10]]
+        makespans = [ep['final_makespan'] for ep in DETAILED_EPISODES[:10]]
+        
+        if len(returns) == len(makespans) and len(returns) > 1:
+            ax6.scatter(makespans, returns, alpha=0.7, s=100)
+            
+            # Add correlation line if enough points
+            if len(returns) > 2:
+                z = np.polyfit(makespans, returns, 1)
+                p = np.poly1d(z)
+                ax6.plot(makespans, p(makespans), "r--", alpha=0.8)
+                
+                # Calculate correlation
+                correlation = np.corrcoef(makespans, returns)[0,1]
+                ax6.text(0.05, 0.95, f'Correlation: {correlation:.3f}', 
+                        transform=ax6.transAxes, fontsize=10,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.5))
+            
+            ax6.set_xlabel('Final Makespan')
+            ax6.set_ylabel('Episode Return')
+            ax6.set_title('Return vs Makespan (First 10 Episodes)')
+            ax6.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('/Users/tanu/Desktop/PhD/Scheduling/src/training_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Print detailed episode information
+    print("\n" + "="*80)
+    print("DETAILED EPISODE ANALYSIS (First 10 Episodes)")
+    print("="*80)
+    
+    for i, episode in enumerate(DETAILED_EPISODES[:10]):
+        print(f"\nEpisode {episode['episode']}:")  
+        print(f"  Job Arrivals: {episode['arrival_times']}")
+        print(f"  Dynamic Arrivals: {episode['dynamic_arrivals']}")
+        print(f"  Steps Taken: {episode['steps_taken']}")
+        print(f"  Episode Return: {episode['episode_return']:.2f}")
+        print(f"  Final Makespan: {episode['final_makespan']:.2f}")
+        print(f"  Avg Reward per Step: {episode['episode_return']/max(episode['steps_taken'], 1):.2f}")
+    
+    print(f"\nTraining Summary:")
+    print(f"  Total Episodes Tracked: {len(TRAINING_RETURNS)}")
+    print(f"  Total Arrival Times Recorded: {len(TRAINING_ARRIVAL_TIMES)}")
+    if TRAINING_ARRIVAL_TIMES:
+        valid_arrivals = [t for t in TRAINING_ARRIVAL_TIMES if 0 < t < 200]
+        if valid_arrivals:
+            print(f"  Mean Arrival Time: {np.mean(valid_arrivals):.2f}")
+            print(f"  Std Arrival Time: {np.std(valid_arrivals):.2f}")
+def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_timesteps=100000, reward_mode="makespan_increment"):
+    """
+    Train a perfect knowledge RL agent using the same approach as test3_backup.py.
+    
+    Key insight: Train on deterministic arrival times (like the test scenario)
+    rather than trying to create a complex "perfect knowledge" environment.
+    This matches the working approach from test3_backup.py.
+    """
+    print(f"\n--- Training Perfect Knowledge RL Agent (test3_backup.py approach) ---")
+    print(f"Training arrival times: {arrival_times}")
+    print(f"Timesteps: {total_timesteps:,} | Reward: {reward_mode}")
+    
+    def make_perfect_env():
+        # Use PerfectKnowledgeFJSPEnv for both training and evaluation consistency
+        class PoissonDynamicFJSPEnv(gym.Env):
+            """
+            SIMPLIFIED Dynamic FJSP Environment with Poisson-distributed job arrivals.
+            Uses the SAME structure as StaticFJSPEnv and PerfectKnowledgeFJSPEnv for consistency.
+            """
+            
+            metadata = {"render.modes": ["human"]}
+
+            def __init__(self, jobs_data, machine_list, initial_jobs=5, arrival_rate=0.05, 
+                         max_time_horizon=200, reward_mode="makespan_increment", seed=None):
+                super().__init__()
+                
+                if seed is not None:
+                    random.seed(seed)
+                    np.random.seed(seed)
+                
+                self.jobs = jobs_data
+                self.machines = machine_list
+                self.job_ids = list(self.jobs.keys())
+                
+                # Handle initial_jobs as either integer or list
+                if isinstance(initial_jobs, list):
+                    self.initial_job_ids = initial_jobs
+                    self.dynamic_job_ids = [j for j in self.job_ids if j not in initial_jobs]
+                    self.initial_jobs = len(initial_jobs)
+                else:
+                    self.initial_jobs = min(initial_jobs, len(self.job_ids))
+                    self.initial_job_ids = self.job_ids[:self.initial_jobs]
+                    self.dynamic_job_ids = self.job_ids[self.initial_jobs:]
+                
+                self.arrival_rate = arrival_rate
+                self.max_time_horizon = max_time_horizon
+                self.reward_mode = reward_mode
+                
+                # Environment parameters
+                self.num_jobs = len(self.job_ids)
+                self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
+                self.total_operations = sum(len(ops) for ops in self.jobs.values())
+                
+                # USE SAME ACTION SPACE as successful environments (FIXED, not dynamic)
+                self.action_space = spaces.Discrete(
+                    min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
+                )
+                
+                # USE SAME OBSERVATION SPACE as successful environments
+                obs_size = (
+                    len(self.machines) +                    # Machine availability
+                    self.num_jobs * self.max_ops_per_job +  # Operation completion status
+                    self.num_jobs +                         # Job progress ratios  
+                    self.num_jobs +                         # Job arrival status
+                    1                                       # Current makespan
+                )
+                
+                self.observation_space = spaces.Box(
+                    low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+                )
+                
+                self._reset_state()
+
+            def _reset_state(self):
+                """Reset all environment state variables - SAME as successful environments."""
+                self.machine_next_free = {m: 0.0 for m in self.machines}
+                self.schedule = {m: [] for m in self.machines}
+                self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
+                self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
+                self.next_operation = {job_id: 0 for job_id in self.job_ids}
+                
+                self.current_makespan = 0.0
+                self.operations_scheduled = 0
+                self.episode_step = 0
+                self.max_episode_steps = self.total_operations * 2
+                
+                # Job arrival management - simplified
+                self.arrived_jobs = set(self.initial_job_ids)  # Initial jobs available immediately
+                self.job_arrival_times = {}
+                
+                # Generate Poisson arrival times for dynamic jobs
+                self._generate_poisson_arrivals()
+
+            def _generate_poisson_arrivals(self):
+                """Generate arrival times for dynamic jobs using Poisson process."""
+                # Initialize arrival times
+                for job_id in self.initial_job_ids:
+                    self.job_arrival_times[job_id] = 0.0
+                
+                # Generate inter-arrival times using exponential distribution
+                current_time = 0.0
+                for job_id in self.dynamic_job_ids:
+                    inter_arrival_time = np.random.exponential(1.0 / self.arrival_rate)
+                    current_time += inter_arrival_time
+                    
+                    # Round to nearest integer for simplicity
+                    integer_arrival_time = round(current_time)
+                    
+                    if integer_arrival_time <= self.max_time_horizon:
+                        self.job_arrival_times[job_id] = float(integer_arrival_time)
+                    else:
+                        self.job_arrival_times[job_id] = float('inf')  # Won't arrive in this episode
+
+            def reset(self, seed=None, options=None):
+                """Reset the environment for a new episode - SAME structure as successful environments."""
+                global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
+                
+                if seed is not None:
+                    super().reset(seed=seed, options=options)
+                    random.seed(seed)
+                    np.random.seed(seed)
+                
+                self._reset_state()
+                
+                # Track arrival times for analysis
+                TRAINING_EPISODE_COUNT += 1
+                episode_arrivals = []
+                for job_id, arr_time in self.job_arrival_times.items():
+                    if arr_time != float('inf') and arr_time > 0:  # Only dynamic arrivals
+                        episode_arrivals.append(arr_time)
+                
+                if episode_arrivals:
+                    TRAINING_ARRIVAL_TIMES.extend(episode_arrivals)
+                
+                return self._get_observation(), {}
+
+            def _decode_action(self, action):
+                """Decode action - SAME as successful environments."""
+                action = int(action) % self.action_space.n
+                num_machines = len(self.machines)
+                ops_per_job = self.max_ops_per_job
+                
+                job_idx = action // (ops_per_job * num_machines)
+                op_idx = (action % (ops_per_job * num_machines)) // num_machines
+                machine_idx = action % num_machines
+                
+                job_idx = min(job_idx, self.num_jobs - 1)
+                machine_idx = min(machine_idx, len(self.machines) - 1)
+                
+                return job_idx, op_idx, machine_idx
+
+            def _is_valid_action(self, job_idx, op_idx, machine_idx):
+                """Check if action is valid - SAME as successful environments."""
+                if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
+                    return False
+                
+                job_id = self.job_ids[job_idx]
+                
+                # Check if job has arrived
+                if job_id not in self.arrived_jobs:
+                    return False
+            
+                # Check operation index validity
+                if not (0 <= op_idx < len(self.jobs[job_id])):
+                    return False
+                    
+                # Check if this is the next operation
+                if op_idx != self.next_operation[job_id]:
+                    return False
+                    
+                # Check machine compatibility
+                machine_name = self.machines[machine_idx]
+                if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
+                    return False
+                    
+                return True
+
+            def action_masks(self):
+                """Generate action masks - SAME as successful environments."""
+                mask = np.full(self.action_space.n, False, dtype=bool)
+                
+                if self.operations_scheduled >= self.total_operations:
+                    return mask
+
+                valid_action_count = 0
+                for job_idx, job_id in enumerate(self.job_ids):
+                    if job_id not in self.arrived_jobs:
+                        continue
+                        
+                    next_op_idx = self.next_operation[job_id]
+                    if next_op_idx >= len(self.jobs[job_id]):
+                        continue
+                        
+                    for machine_idx, machine in enumerate(self.machines):
+                        if machine in self.jobs[job_id][next_op_idx]['proc_times']:
+                            action = job_idx * (self.max_ops_per_job * len(self.machines)) + next_op_idx * len(self.machines) + machine_idx
+                            if action < self.action_space.n:
+                                mask[action] = True
+                                valid_action_count += 1
+                
+                if valid_action_count == 0:
+                    mask.fill(True)
+                    
+                return mask
+
+            def step(self, action):
+                """Step function - SIMPLIFIED to match successful environments."""
+                self.episode_step += 1
+                
+                # Safety check for infinite episodes
+                if self.episode_step >= self.max_episode_steps:
+                    return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
+                
+                job_idx, op_idx, machine_idx = self._decode_action(action)
+
+                # Use softer invalid action handling like successful environments
+                if not self._is_valid_action(job_idx, op_idx, machine_idx):
+                    return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+
+                job_id = self.job_ids[job_idx]
+                machine = self.machines[machine_idx]
+                
+                # Calculate timing using successful environments' approach
+                machine_available_time = self.machine_next_free.get(machine, 0.0)
+                job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
+                                 else self.job_arrival_times.get(job_id, 0.0))
+                
+                start_time = max(machine_available_time, job_ready_time)
+                proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
+                end_time = start_time + proc_time
+
+                # Update state
+                previous_makespan = self.current_makespan
+                self.machine_next_free[machine] = end_time
+                self.operation_end_times[job_id][op_idx] = end_time
+                self.completed_ops[job_id][op_idx] = True
+                self.next_operation[job_id] += 1
+                self.operations_scheduled += 1
+                
+                # Update makespan and check for new arrivals (key improvement)
+                self.current_makespan = max(self.current_makespan, end_time)
+                
+                # Check for newly arrived jobs (deterministic based on current makespan)
+                newly_arrived = []
+                for job_id_check, arrival_time in self.job_arrival_times.items():
+                    if (job_id_check not in self.arrived_jobs and 
+                        arrival_time <= self.current_makespan and 
+                        arrival_time != float('inf')):
+                        self.arrived_jobs.add(job_id_check)
+                        newly_arrived.append(job_id_check)
+
+                # Record in schedule
+                self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+
+                # Check termination
+                terminated = self.operations_scheduled >= self.total_operations
+                
+                # SIMPLIFIED reward calculation matching successful environments
+                idle_time = max(0, start_time - machine_available_time)
+                reward = self._calculate_reward(proc_time, idle_time, terminated, 
+                                              previous_makespan, self.current_makespan, len(newly_arrived))
+                
+                info = {
+                    "makespan": self.current_makespan,
+                    "newly_arrived_jobs": len(newly_arrived),
+                    "total_arrived_jobs": len(self.arrived_jobs)
+                }
+                
+                return self._get_observation(), reward, terminated, False, info
+
+            def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan, num_new_arrivals):
+                """SIMPLIFIED reward function matching successful environments."""
+                
+                if self.reward_mode == "makespan_increment":
+                    # Use SAME reward structure as successful environments
+                    if previous_makespan is not None and current_makespan is not None:
+                        makespan_increment = current_makespan - previous_makespan
+                        reward = -makespan_increment  # Negative increment
+                        
+                        # Small bonus for utilizing newly arrived jobs (dynamic advantage)
+                        if num_new_arrivals > 0:
+                            reward += 5.0 * num_new_arrivals
+                        
+                        # Add completion bonus
+                        if done:
+                            reward += 50.0
+                            
+                        return reward
+                    else:
+                        return -proc_time
+                else:
+                    # Default reward function matching successful environments
+                    reward = 10.0 - proc_time * 0.1 - idle_time
+                    if done:
+                        reward += 100.0
+                    return reward
+
+            def _get_observation(self):
+                """
+                Simplified observation similar to successful PerfectKnowledgeFJSPEnv.
+                Focus on essential information without over-complication.
+                """
+                norm_factor = max(self.current_makespan, 1.0)
+                obs = []
+                
+                # Machine availability (normalized by current makespan)
+                for m in self.machines:
+                    value = float(self.machine_next_free.get(m, 0.0)) / norm_factor
+                    obs.append(max(0.0, min(1.0, value)))
+                
+                # Operation completion status (padded to max_ops_per_job)
+                for job_id in self.job_ids:
+                    for op_idx in range(self.max_ops_per_job):
+                        if op_idx < len(self.jobs[job_id]):
+                            completed = 1.0 if self.completed_ops[job_id][op_idx] else 0.0
+                        else:
+                            completed = 1.0  # Non-existent operations considered completed
+                        obs.append(float(completed))
+                
+                # Job progress (proportion of operations completed)
+                for job_id in self.job_ids:
+                    total_ops = len(self.jobs[job_id])
+                    if total_ops > 0:
+                        progress = float(self.next_operation[job_id]) / float(total_ops)
+                    else:
+                        progress = 1.0
+                    obs.append(max(0.0, min(1.0, progress)))
+                
+                # Job arrival status (arrived or not)
+                for job_id in self.job_ids:
+                    if job_id in self.arrived_jobs:
+                        obs.append(1.0)  # Job is available
+                    else:
+                        obs.append(0.0)  # Job not yet arrived
+                    
+                # Current makespan (normalized)
+                makespan_norm = float(self.current_makespan) / 100.0  # Assume max makespan around 100
+                obs.append(max(0.0, min(1.0, makespan_norm)))
+                
+                # Pad or truncate to match observation space
+                target_size = self.observation_space.shape[0]
+                if len(obs) < target_size:
+                    obs.extend([0.0] * (target_size - len(obs)))
+                elif len(obs) > target_size:
+                    obs = obs[:target_size]
+                
+                # Ensure proper format
+                obs_array = np.array(obs, dtype=np.float32)
+                obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
+                
+                return obs_array
+
+            def render(self, mode='human'):
+                """Render the current state (optional)."""
+                if mode == 'human':
+                    print(f"\n=== Time: {self.current_makespan:.2f} ===")
+                    print(f"Arrived jobs: {sorted(self.arrived_jobs)}")
+                    print(f"Completed operations: {self.operations_scheduled}")
+                    print(f"Machine status:")
+                    for m in self.machines:
+                        print(f"  {m}: next free at {self.machine_next_free[m]:.2f}")
 
 
 class StaticFJSPEnv(gym.Env):
@@ -120,7 +672,6 @@ class StaticFJSPEnv(gym.Env):
     def reset(self, seed=None, options=None):
         """Reset environment - same as PerfectKnowledgeFJSPEnv."""
         if seed is not None:
-            super().reset(seed=seed, options=options)
             random.seed(seed)
             np.random.seed(seed)
         
@@ -253,9 +804,9 @@ class StaticFJSPEnv(gym.Env):
                 makespan_increment = current_makespan - previous_makespan
                 reward = -makespan_increment  # Negative increment
                 
-                # Add completion bonus
-                if done:
-                    reward += 50.0
+                # # Add completion bonus
+                # if done:
+                #     reward += 50.0
                     
                 return reward
             else:
@@ -268,7 +819,10 @@ class StaticFJSPEnv(gym.Env):
             return reward
 
     def _get_observation(self):
-        """Generate observation - same structure as PerfectKnowledgeFJSPEnv."""
+        """
+        Generate observation - same structure as PerfectKnowledgeFJSPEnv.
+        Focus on essential information without over-complication.
+        """
         norm_factor = max(self.current_makespan, 1.0)
         obs = []
         
@@ -337,9 +891,6 @@ class PoissonDynamicFJSPEnv(gym.Env):
     def __init__(self, jobs_data, machine_list, initial_jobs=5, arrival_rate=0.05, 
                  max_time_horizon=200, reward_mode="makespan_increment", seed=None):
         """
-        Initialize the Poisson Dynamic FJSP Environment.
-        
-        Args:
             jobs_data: Dictionary of all possible jobs
             machine_list: List of available machines
             initial_jobs: Number of jobs available at start (default: 5)
@@ -440,7 +991,7 @@ class PoissonDynamicFJSPEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         """Reset the environment for a new episode - SAME structure as successful environments."""
-        global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT, DEBUG_EPISODE_ARRIVALS
+        global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT, DETAILED_EPISODES
         
         if seed is not None:
             super().reset(seed=seed, options=options)
@@ -459,17 +1010,19 @@ class PoissonDynamicFJSPEnv(gym.Env):
         if episode_arrivals:
             TRAINING_ARRIVAL_TIMES.extend(episode_arrivals)
         
-        # Debug: Track first 10 episodes in detail (silently)
+        # Track detailed information for first 10 episodes
         if TRAINING_EPISODE_COUNT <= 10:
-            episode_debug_info = {
+            episode_detail = {
                 'episode': TRAINING_EPISODE_COUNT,
-                'initial_jobs': sorted(self.initial_job_ids),
-                'dynamic_jobs': sorted(self.dynamic_job_ids),
-                'arrival_times': dict(self.job_arrival_times),
-                'arrived_at_reset': sorted(self.arrived_jobs),
-                'dynamic_arrivals': sorted(episode_arrivals) if episode_arrivals else []
+                'arrival_times': self.job_arrival_times.copy(),
+                'initial_jobs': list(self.arrived_jobs),
+                'dynamic_arrivals': [arr for arr in episode_arrivals if arr < 200],
+                'episode_rewards': [],
+                'episode_return': 0.0,
+                'final_makespan': 0.0,
+                'steps_taken': 0
             }
-            DEBUG_EPISODE_ARRIVALS.append(episode_debug_info)
+            DETAILED_EPISODES.append(episode_detail)
         
         return self._get_observation(), {}
 
@@ -544,6 +1097,8 @@ class PoissonDynamicFJSPEnv(gym.Env):
 
     def step(self, action):
         """Step function - SIMPLIFIED to match successful environments."""
+        global TRAINING_EPISODE_COUNT, DETAILED_EPISODES
+        
         self.episode_step += 1
         
         # Safety check for infinite episodes
@@ -554,7 +1109,13 @@ class PoissonDynamicFJSPEnv(gym.Env):
 
         # Use softer invalid action handling like successful environments
         if not self._is_valid_action(job_idx, op_idx, machine_idx):
-            return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+            reward = -50.0
+            # Track reward for detailed episodes
+            if TRAINING_EPISODE_COUNT <= 10 and DETAILED_EPISODES:
+                DETAILED_EPISODES[-1]['episode_rewards'].append(reward)
+                DETAILED_EPISODES[-1]['episode_return'] += reward
+                DETAILED_EPISODES[-1]['steps_taken'] += 1
+            return self._get_observation(), reward, False, False, {"error": "Invalid action, continuing"}
 
         job_id = self.job_ids[job_idx]
         machine = self.machines[machine_idx]
@@ -598,6 +1159,13 @@ class PoissonDynamicFJSPEnv(gym.Env):
         idle_time = max(0, start_time - machine_available_time)
         reward = self._calculate_reward(proc_time, idle_time, terminated, 
                                       previous_makespan, self.current_makespan, len(newly_arrived))
+        
+        # Track detailed episode information
+        if TRAINING_EPISODE_COUNT <= 10 and DETAILED_EPISODES:
+            DETAILED_EPISODES[-1]['episode_rewards'].append(reward)
+            DETAILED_EPISODES[-1]['episode_return'] += reward
+            DETAILED_EPISODES[-1]['steps_taken'] += 1
+            DETAILED_EPISODES[-1]['final_makespan'] = self.current_makespan
         
         info = {
             "makespan": self.current_makespan,
@@ -665,7 +1233,7 @@ class PoissonDynamicFJSPEnv(gym.Env):
                 progress = 1.0
             obs.append(max(0.0, min(1.0, progress)))
         
-        # Job arrival status (simple binary: arrived or not)
+        # Job arrival status (arrived or not)
         for job_id in self.job_ids:
             if job_id in self.arrived_jobs:
                 obs.append(1.0)  # Job is available
@@ -689,31 +1257,6 @@ class PoissonDynamicFJSPEnv(gym.Env):
         
         return obs_array
 
-    # def debug_step(self, action):
-    #     """Debug version of step function to identify issues."""
-    #     print(f"\n=== DEBUG STEP ===")
-    #     job_idx, op_idx, machine_idx = self._decode_action(action)
-    #     print(f"Action: {action} -> Job {job_idx}, Op {op_idx}, Machine {machine_idx}")
-        
-    #     if job_idx < len(self.job_ids):
-    #         job_id = self.job_ids[job_idx]
-    #         print(f"Job ID: {job_id}")
-    #         print(f"Job arrived: {job_id in self.arrived_jobs}")
-    #         print(f"Next operation: {self.next_operation[job_id]}")
-    #         print(f"Job operations: {len(self.jobs[job_id])}")
-            
-    #         if op_idx < len(self.jobs[job_id]):
-    #             print(f"Operation data: {self.jobs[job_id][op_idx]}")
-    #             machine_name = self.machines[machine_idx]
-    #             print(f"Machine {machine_name} can process: {machine_name in self.jobs[job_id][op_idx]['proc_times']}")
-        
-    #     print(f"Valid action: {self._is_valid_action(job_idx, op_idx, machine_idx)}")
-    #     print(f"Arrived jobs: {sorted(self.arrived_jobs)}")
-    #     print(f"Current time: {self.current_time}")
-    #     print("================")
-        
-    #     return self.step(action)
-
     def render(self, mode='human'):
         """Render the current state (optional)."""
         if mode == 'human':
@@ -733,41 +1276,6 @@ def mask_fn(env):
 # Import the already working environment classes
 # exec(open('dynamic_poisson_fjsp.py').read())
 
-class TrainingCallback:
-    """Callback to track training metrics including action entropy."""
-    
-    def __init__(self, method_name):
-        self.method_name = method_name
-        self.step_count = 0
-        
-    def __call__(self, locals_dict, globals_dict):
-        global TRAINING_METRICS
-        
-        # Extract PPO model from locals
-        model = locals_dict.get('self')
-        
-        if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
-            log_data = model.logger.name_to_value
-            
-            # Log entropy if available
-            if 'train/entropy_loss' in log_data:
-                TRAINING_METRICS['action_entropy'].append(log_data['train/entropy_loss'])
-            
-            # Log policy and value losses
-            if 'train/policy_gradient_loss' in log_data:
-                TRAINING_METRICS['policy_loss'].append(log_data['train/policy_gradient_loss'])
-            if 'train/value_loss' in log_data:
-                TRAINING_METRICS['value_loss'].append(log_data['train/value_loss'])
-            
-            TRAINING_METRICS['timesteps'].append(model.num_timesteps)
-            
-            # Suppress periodic entropy updates during training for cleaner output
-            # if len(TRAINING_METRICS['action_entropy']) > 0 and len(TRAINING_METRICS['action_entropy']) % 10 == 0:
-            #     recent_entropy = TRAINING_METRICS['action_entropy'][-1]
-            #     print(f"  {self.method_name} - Step {model.num_timesteps}: Action Entropy = {recent_entropy:.4f}")
-        
-        return True
-
 def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_timesteps=100000, reward_mode="makespan_increment"):
     """
     Train a perfect knowledge RL agent using the same approach as test3_backup.py.
@@ -779,59 +1287,370 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     print(f"\n--- Training Perfect Knowledge RL Agent (test3_backup.py approach) ---")
     print(f"Training arrival times: {arrival_times}")
     print(f"Timesteps: {total_timesteps:,} | Reward: {reward_mode}")
-    print(f"Fixed seed: {GLOBAL_SEED} (for reproducibility)")
     
     def make_perfect_env():
         # Use PerfectKnowledgeFJSPEnv for both training and evaluation consistency
-    
-        env = PerfectKnowledgeFJSPEnv(jobs_data, machine_list, arrival_times, reward_mode=reward_mode)
-        env = ActionMasker(env, mask_fn)
-        return env
+        class PoissonDynamicFJSPEnv(gym.Env):
+            """
+            SIMPLIFIED Dynamic FJSP Environment with Poisson-distributed job arrivals.
+            Uses the SAME structure as StaticFJSPEnv and PerfectKnowledgeFJSPEnv for consistency.
+            """
+            
+            metadata = {"render.modes": ["human"]}
 
-    vec_env = DummyVecEnv([make_perfect_env])
-    
-    # Use similar hyperparameters as in test3_backup.py
-    model = MaskablePPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=0,
-        learning_rate=3e-4,        # Matches test3_backup.py
-        n_steps=2048,              # Matches test3_backup.py
-        batch_size=128,            # Matches test3_backup.py  
-        n_epochs=10,               # Matches test3_backup.py
-        gamma=1,                # Matches test3_backup.py
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        seed=GLOBAL_SEED,          # Ensure reproducibility
-        policy_kwargs=dict(
-            net_arch=[512, 512, 256],  # Matches test3_backup.py
-            activation_fn=torch.nn.ReLU
-        )
-    )
-    
-    # Training with progress bar and entropy tracking
-    print("Training perfect knowledge agent (deterministic arrival times)...")
-    callback = TrainingCallback("Perfect Knowledge RL")
-    
-    with tqdm(total=total_timesteps, desc="Perfect Knowledge Training") as pbar:
-        def combined_callback(locals_dict, globals_dict):
-            callback(locals_dict, globals_dict)
-            pbar.update(model.n_steps)
-            return True
-        
-        model.learn(total_timesteps=total_timesteps, callback=combined_callback)
-    
-    print(f"Perfect knowledge training completed!")
-    return model
+            def __init__(self, jobs_data, machine_list, initial_jobs=5, arrival_rate=0.05, 
+                         max_time_horizon=200, reward_mode="makespan_increment", seed=None):
+                super().__init__()
+                
+                if seed is not None:
+                    random.seed(seed)
+                    np.random.seed(seed)
+                
+                self.jobs = jobs_data
+                self.machines = machine_list
+                self.job_ids = list(self.jobs.keys())
+                
+                # Handle initial_jobs as either integer or list
+                if isinstance(initial_jobs, list):
+                    self.initial_job_ids = initial_jobs
+                    self.dynamic_job_ids = [j for j in self.job_ids if j not in initial_jobs]
+                    self.initial_jobs = len(initial_jobs)
+                else:
+                    self.initial_jobs = min(initial_jobs, len(self.job_ids))
+                    self.initial_job_ids = self.job_ids[:self.initial_jobs]
+                    self.dynamic_job_ids = self.job_ids[self.initial_jobs:]
+                
+                self.arrival_rate = arrival_rate
+                self.max_time_horizon = max_time_horizon
+                self.reward_mode = reward_mode
+                
+                # Environment parameters
+                self.num_jobs = len(self.job_ids)
+                self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
+                self.total_operations = sum(len(ops) for ops in self.jobs.values())
+                
+                # USE SAME ACTION SPACE as successful environments (FIXED, not dynamic)
+                self.action_space = spaces.Discrete(
+                    min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
+                )
+                
+                # USE SAME OBSERVATION SPACE as successful environments
+                obs_size = (
+                    len(self.machines) +                    # Machine availability
+                    self.num_jobs * self.max_ops_per_job +  # Operation completion status
+                    self.num_jobs +                         # Job progress ratios  
+                    self.num_jobs +                         # Job arrival status
+                    1                                       # Current makespan
+                )
+                
+                self.observation_space = spaces.Box(
+                    low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+                )
+                
+                self._reset_state()
+
+            def _reset_state(self):
+                """Reset all environment state variables - SAME as successful environments."""
+                self.machine_next_free = {m: 0.0 for m in self.machines}
+                self.schedule = {m: [] for m in self.machines}
+                self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
+                self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
+                self.next_operation = {job_id: 0 for job_id in self.job_ids}
+                
+                self.current_makespan = 0.0
+                self.operations_scheduled = 0
+                self.episode_step = 0
+                self.max_episode_steps = self.total_operations * 2
+                
+                # Job arrival management - simplified
+                self.arrived_jobs = set(self.initial_job_ids)  # Initial jobs available immediately
+                self.job_arrival_times = {}
+                
+                # Generate Poisson arrival times for dynamic jobs
+                self._generate_poisson_arrivals()
+
+            def _generate_poisson_arrivals(self):
+                """Generate arrival times for dynamic jobs using Poisson process."""
+                # Initialize arrival times
+                for job_id in self.initial_job_ids:
+                    self.job_arrival_times[job_id] = 0.0
+                
+                # Generate inter-arrival times using exponential distribution
+                current_time = 0.0
+                for job_id in self.dynamic_job_ids:
+                    inter_arrival_time = np.random.exponential(1.0 / self.arrival_rate)
+                    current_time += inter_arrival_time
+                    
+                    # Round to nearest integer for simplicity
+                    integer_arrival_time = round(current_time)
+                    
+                    if integer_arrival_time <= self.max_time_horizon:
+                        self.job_arrival_times[job_id] = float(integer_arrival_time)
+                    else:
+                        self.job_arrival_times[job_id] = float('inf')  # Won't arrive in this episode
+
+            def reset(self, seed=None, options=None):
+                """Reset the environment for a new episode - SAME structure as successful environments."""
+                global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
+                
+                if seed is not None:
+                    super().reset(seed=seed, options=options)
+                    random.seed(seed)
+                    np.random.seed(seed)
+                
+                self._reset_state()
+                
+                # Track arrival times for analysis
+                TRAINING_EPISODE_COUNT += 1
+                episode_arrivals = []
+                for job_id, arr_time in self.job_arrival_times.items():
+                    if arr_time != float('inf') and arr_time > 0:  # Only dynamic arrivals
+                        episode_arrivals.append(arr_time)
+                
+                if episode_arrivals:
+                    TRAINING_ARRIVAL_TIMES.extend(episode_arrivals)
+                
+                return self._get_observation(), {}
+
+            def _decode_action(self, action):
+                """Decode action - SAME as successful environments."""
+                action = int(action) % self.action_space.n
+                num_machines = len(self.machines)
+                ops_per_job = self.max_ops_per_job
+                
+                job_idx = action // (ops_per_job * num_machines)
+                op_idx = (action % (ops_per_job * num_machines)) // num_machines
+                machine_idx = action % num_machines
+                
+                job_idx = min(job_idx, self.num_jobs - 1)
+                machine_idx = min(machine_idx, len(self.machines) - 1)
+                
+                return job_idx, op_idx, machine_idx
+
+            def _is_valid_action(self, job_idx, op_idx, machine_idx):
+                """Check if action is valid - SAME as successful environments."""
+                if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
+                    return False
+                
+                job_id = self.job_ids[job_idx]
+                
+                # Check if job has arrived
+                if job_id not in self.arrived_jobs:
+                    return False
+            
+                # Check operation index validity
+                if not (0 <= op_idx < len(self.jobs[job_id])):
+                    return False
+                    
+                # Check if this is the next operation
+                if op_idx != self.next_operation[job_id]:
+                    return False
+                    
+                # Check machine compatibility
+                machine_name = self.machines[machine_idx]
+                if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
+                    return False
+                    
+                return True
+
+            def action_masks(self):
+                """Generate action masks - SAME as successful environments."""
+                mask = np.full(self.action_space.n, False, dtype=bool)
+                
+                if self.operations_scheduled >= self.total_operations:
+                    return mask
+
+                valid_action_count = 0
+                for job_idx, job_id in enumerate(self.job_ids):
+                    if job_id not in self.arrived_jobs:
+                        continue
+                        
+                    next_op_idx = self.next_operation[job_id]
+                    if next_op_idx >= len(self.jobs[job_id]):
+                        continue
+                        
+                    for machine_idx, machine in enumerate(self.machines):
+                        if machine in self.jobs[job_id][next_op_idx]['proc_times']:
+                            action = job_idx * (self.max_ops_per_job * len(self.machines)) + next_op_idx * len(self.machines) + machine_idx
+                            if action < self.action_space.n:
+                                mask[action] = True
+                                valid_action_count += 1
+                
+                if valid_action_count == 0:
+                    mask.fill(True)
+                    
+                return mask
+
+            def step(self, action):
+                """Step function - SIMPLIFIED to match successful environments."""
+                self.episode_step += 1
+                
+                # Safety check for infinite episodes
+                if self.episode_step >= self.max_episode_steps:
+                    return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
+                
+                job_idx, op_idx, machine_idx = self._decode_action(action)
+
+                # Use softer invalid action handling like successful environments
+                if not self._is_valid_action(job_idx, op_idx, machine_idx):
+                    return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+
+                job_id = self.job_ids[job_idx]
+                machine = self.machines[machine_idx]
+                
+                # Calculate timing using successful environments' approach
+                machine_available_time = self.machine_next_free.get(machine, 0.0)
+                job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
+                                 else self.job_arrival_times.get(job_id, 0.0))
+                
+                start_time = max(machine_available_time, job_ready_time)
+                proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
+                end_time = start_time + proc_time
+
+                # Update state
+                previous_makespan = self.current_makespan
+                self.machine_next_free[machine] = end_time
+                self.operation_end_times[job_id][op_idx] = end_time
+                self.completed_ops[job_id][op_idx] = True
+                self.next_operation[job_id] += 1
+                self.operations_scheduled += 1
+                
+                # Update makespan and check for new arrivals (key improvement)
+                self.current_makespan = max(self.current_makespan, end_time)
+                
+                # Check for newly arrived jobs (deterministic based on current makespan)
+                newly_arrived = []
+                for job_id_check, arrival_time in self.job_arrival_times.items():
+                    if (job_id_check not in self.arrived_jobs and 
+                        arrival_time <= self.current_makespan and 
+                        arrival_time != float('inf')):
+                        self.arrived_jobs.add(job_id_check)
+                        newly_arrived.append(job_id_check)
+
+                # Record in schedule
+                self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+
+                # Check termination
+                terminated = self.operations_scheduled >= self.total_operations
+                
+                # SIMPLIFIED reward calculation matching successful environments
+                idle_time = max(0, start_time - machine_available_time)
+                reward = self._calculate_reward(proc_time, idle_time, terminated, 
+                                      previous_makespan, self.current_makespan, len(newly_arrived))
+                
+                # Track detailed episode information
+                if TRAINING_EPISODE_COUNT <= 10 and DETAILED_EPISODES:
+                    DETAILED_EPISODES[-1]['episode_rewards'].append(reward)
+                    DETAILED_EPISODES[-1]['episode_return'] += reward
+                    DETAILED_EPISODES[-1]['steps_taken'] += 1
+                    DETAILED_EPISODES[-1]['final_makespan'] = self.current_makespan
+                
+                info = {
+                    "makespan": self.current_makespan,
+                    "newly_arrived_jobs": len(newly_arrived),
+                    "total_arrived_jobs": len(self.arrived_jobs)
+                }
+                
+                return self._get_observation(), reward, terminated, False, info
+
+            def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan, num_new_arrivals):
+                """SIMPLIFIED reward function matching successful environments."""
+                
+                if self.reward_mode == "makespan_increment":
+                    # Use SAME reward structure as successful environments
+                    if previous_makespan is not None and current_makespan is not None:
+                        makespan_increment = current_makespan - previous_makespan
+                        reward = -makespan_increment  # Negative increment
+                        
+                        # Small bonus for utilizing newly arrived jobs (dynamic advantage)
+                        if num_new_arrivals > 0:
+                            reward += 5.0 * num_new_arrivals
+                        
+                        # Add completion bonus
+                        if done:
+                            reward += 50.0
+                            
+                        return reward
+                    else:
+                        return -proc_time
+                else:
+                    # Default reward function matching successful environments
+                    reward = 10.0 - proc_time * 0.1 - idle_time
+                    if done:
+                        reward += 100.0
+                    return reward
+
+            def _get_observation(self):
+                """
+                Simplified observation similar to successful PerfectKnowledgeFJSPEnv.
+                Focus on essential information without over-complication.
+                """
+                norm_factor = max(self.current_makespan, 1.0)
+                obs = []
+                
+                # Machine availability (normalized by current makespan)
+                for m in self.machines:
+                    value = float(self.machine_next_free.get(m, 0.0)) / norm_factor
+                    obs.append(max(0.0, min(1.0, value)))
+                
+                # Operation completion status (padded to max_ops_per_job)
+                for job_id in self.job_ids:
+                    for op_idx in range(self.max_ops_per_job):
+                        if op_idx < len(self.jobs[job_id]):
+                            completed = 1.0 if self.completed_ops[job_id][op_idx] else 0.0
+                        else:
+                            completed = 1.0  # Non-existent operations considered completed
+                        obs.append(float(completed))
+                
+                # Job progress (proportion of operations completed)
+                for job_id in self.job_ids:
+                    total_ops = len(self.jobs[job_id])
+                    if total_ops > 0:
+                        progress = float(self.next_operation[job_id]) / float(total_ops)
+                    else:
+                        progress = 1.0
+                    obs.append(max(0.0, min(1.0, progress)))
+                
+                # Job arrival status (arrived or not)
+                for job_id in self.job_ids:
+                    if job_id in self.arrived_jobs:
+                        obs.append(1.0)  # Job is available
+                    else:
+                        obs.append(0.0)  # Job not yet arrived
+                    
+                # Current makespan (normalized)
+                makespan_norm = float(self.current_makespan) / 100.0  # Assume max makespan around 100
+                obs.append(max(0.0, min(1.0, makespan_norm)))
+                
+                # Pad or truncate to match observation space
+                target_size = self.observation_space.shape[0]
+                if len(obs) < target_size:
+                    obs.extend([0.0] * (target_size - len(obs)))
+                elif len(obs) > target_size:
+                    obs = obs[:target_size]
+                
+                # Ensure proper format
+                obs_array = np.array(obs, dtype=np.float32)
+                obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
+                
+                return obs_array
+
+            def render(self, mode='human'):
+                """Render the current state (optional)."""
+                if mode == 'human':
+                    print(f"\n=== Time: {self.current_makespan:.2f} ===")
+                    print(f"Arrived jobs: {sorted(self.arrived_jobs)}")
+                    print(f"Completed operations: {self.operations_scheduled}")
+                    print(f"Machine status:")
+                    for m in self.machines:
+                        print(f"  {m}: next free at {self.machine_next_free[m]:.2f}")
 
 
 def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_mode="makespan_increment"):
     """Train a static RL agent where all jobs are available at t=0."""
     print(f"\n--- Training Static RL Agent on {len(jobs_data)} jobs ---")
     print(f"Timesteps: {total_timesteps:,} | Reward: {reward_mode}")
+    
     
     def make_static_env():
         env = StaticFJSPEnv(jobs_data, machine_list, reward_mode=reward_mode)
@@ -852,25 +1671,19 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.01,
-        seed=GLOBAL_SEED,      # Ensure reproducibility
         policy_kwargs=dict(
             net_arch=[256, 128, 64],  # Smaller network for 7-job dataset
             activation_fn=torch.nn.ReLU
         )
     )
     
-    print(f"Training Static RL for {total_timesteps:,} timesteps with seed {GLOBAL_SEED}...")
+    print(f"Training Static RL for {total_timesteps:,} timesteps...")
     
-    # Train with tqdm progress bar and entropy tracking
+    # Train with tqdm progress bar
     start_time = time.time()
-    callback = TrainingCallback("Static RL")
     
     with tqdm(total=total_timesteps, desc="Static RL", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
-        
-        def combined_callback(locals_dict, globals_dict):
-            callback(locals_dict, globals_dict)
-            return True
         
         # Break training into chunks for progress updates
         chunk_size = total_timesteps // 30  # 30 chunks
@@ -878,7 +1691,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
         
         while remaining_timesteps > 0:
             current_chunk = min(chunk_size, remaining_timesteps)
-            model.learn(total_timesteps=current_chunk, callback=combined_callback)
+            model.learn(total_timesteps=current_chunk)
             pbar.update(current_chunk)
             remaining_timesteps -= current_chunk
     
@@ -928,7 +1741,6 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
     def reset(self, seed=None, options=None):
         """Reset environment - based on test3_backup.py approach."""
         if seed is not None:
-            super().reset(seed=seed, options=options)
             random.seed(seed)
             np.random.seed(seed)
         
@@ -1033,7 +1845,6 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
 
         # Use softer invalid action handling like test3_backup.py
         if not self._is_valid_action(job_idx, op_idx, machine_idx):
-            # Give a negative reward but don't terminate - helps learning
             return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
 
         job_id = self.job_ids[job_idx]
@@ -1049,6 +1860,7 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         end_time = start_time + proc_time
 
         # Update state
+        previous_makespan = self.current_makespan
         self.machine_next_free[machine] = end_time
         self.operation_end_times[job_id][op_idx] = end_time
         self.completed_ops[job_id][op_idx] = True
@@ -1056,15 +1868,16 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         self.operations_scheduled += 1
         
         # Update makespan and check for new arrivals (key improvement)
-        previous_makespan = self.current_makespan
         self.current_makespan = max(self.current_makespan, end_time)
         
-        # Check for newly arrived jobs (deterministic)
-        newly_arrived = {
-            j_id for j_id, arrival in self.job_arrival_times.items()
-            if previous_makespan < arrival <= self.current_makespan
-        }
-        self.arrived_jobs.update(newly_arrived)
+        # Check for newly arrived jobs (deterministic based on current makespan)
+        newly_arrived = []
+        for job_id_check, arrival_time in self.job_arrival_times.items():
+            if (job_id_check not in self.arrived_jobs and 
+                arrival_time <= self.current_makespan and 
+                arrival_time != float('inf')):
+                self.arrived_jobs.add(job_id_check)
+                newly_arrived.append(job_id_check)
 
         # Record in schedule
         self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
@@ -1214,7 +2027,6 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
         ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
-        seed=GLOBAL_SEED,          # Ensure reproducibility
         policy_kwargs=dict(
             net_arch=[512, 512, 256],  # Match PerfectKnowledgeFJSPEnv
             activation_fn=torch.nn.ReLU
@@ -1227,22 +2039,20 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     batches = total_timesteps // model.n_steps
     episodes_per_batch = model.n_steps // avg_episode_length
     
-    print(f"Training Dynamic RL for {total_timesteps:,} timesteps with seed {GLOBAL_SEED}...")
+    print(f"Training Dynamic RL for {total_timesteps:,} timesteps...")
     print(f"Using simplified approach matching successful environments")
     
     # Train with progress bar like PerfectKnowledgeFJSPEnv
     start_time = time.time()
-    callback = TrainingCallback("Dynamic RL")
     
     with tqdm(total=total_timesteps, desc="Dynamic RL Training") as pbar:
-        def combined_callback(locals_dict, globals_dict):
-            callback(locals_dict, globals_dict)
+        def callback(locals, globals):
             if hasattr(model, 'num_timesteps'):
                 pbar.n = model.num_timesteps
                 pbar.refresh()
             return True
         
-        model.learn(total_timesteps=total_timesteps, callback=combined_callback)
+        model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
     training_time = end_time - start_time
@@ -1308,171 +2118,6 @@ def generate_test_scenarios(jobs_data, initial_jobs=[0, 1, 2, 3, 4], arrival_rat
     
     return scenarios
 
-
-def analyze_first_10_episodes():
-    """
-    Analyze and display the dynamic job arrivals for the first 10 episodes.
-    This helps understand the variation in Poisson arrival patterns during early training.
-    """
-    global DEBUG_EPISODE_ARRIVALS
-    
-    if not DEBUG_EPISODE_ARRIVALS:
-        print("No debug episode data recorded!")
-        return
-    
-    print(f"\n" + "="*80)
-    print("FIRST 10 EPISODES - DYNAMIC JOB ARRIVAL ANALYSIS")
-    print("="*80)
-    
-    for episode_info in DEBUG_EPISODE_ARRIVALS:
-        ep_num = episode_info['episode'] 
-        arrival_times = episode_info['arrival_times']
-        dynamic_arrivals = episode_info['dynamic_arrivals']
-        
-        print(f"\nEpisode {ep_num}:")
-        print(f"  Jobs arriving dynamically: {len(dynamic_arrivals)} jobs")
-        if dynamic_arrivals:
-            print(f"  Arrival times: {dynamic_arrivals}")
-            print(f"  Time span: {min(dynamic_arrivals):.1f} - {max(dynamic_arrivals):.1f}")
-            print(f"  Average inter-arrival: {(max(dynamic_arrivals) - min(dynamic_arrivals)) / max(1, len(dynamic_arrivals)-1):.1f}")
-        else:
-            print(f"  No dynamic arrivals (all jobs beyond time horizon)")
-            
-        # Show which jobs will never arrive
-        no_arrival_jobs = [j for j, t in arrival_times.items() if t == float('inf')]
-        if no_arrival_jobs:
-            print(f"  Jobs not arriving: {sorted(no_arrival_jobs)}")
-    
-    # Summary statistics
-    all_dynamic_arrivals = []
-    episodes_with_arrivals = 0
-    for ep_info in DEBUG_EPISODE_ARRIVALS:
-        if ep_info['dynamic_arrivals']:
-            all_dynamic_arrivals.extend(ep_info['dynamic_arrivals'])
-            episodes_with_arrivals += 1
-    
-    print(f"\n" + "-"*80)
-    print("SUMMARY (First 10 Episodes):")
-    print(f"Episodes with dynamic arrivals: {episodes_with_arrivals}/{len(DEBUG_EPISODE_ARRIVALS)}")
-    if all_dynamic_arrivals:
-        print(f"Total dynamic arrivals: {len(all_dynamic_arrivals)}")
-        print(f"Arrival time range: {min(all_dynamic_arrivals):.1f} - {max(all_dynamic_arrivals):.1f}")
-        print(f"Average arrival time: {np.mean(all_dynamic_arrivals):.1f}")
-        print(f"Std deviation: {np.std(all_dynamic_arrivals):.1f}")
-    else:
-        print("No dynamic arrivals recorded in first 10 episodes!")
-    print("="*80)
-
-def plot_training_metrics():
-    """
-    Plot training metrics including action entropy, policy loss, and value loss.
-    This helps debug PPO exploration and convergence issues.
-    """
-    global TRAINING_METRICS
-    
-    if not TRAINING_METRICS['timesteps']:
-        print("No training metrics recorded!")
-        return
-    
-    print(f"\n=== TRAINING METRICS ANALYSIS ===")
-    print(f"Total training steps recorded: {len(TRAINING_METRICS['timesteps'])}")
-    
-    # Create figure with subplots
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('PPO Training Metrics Analysis - Debugging Exploration & Convergence', fontsize=16, fontweight='bold')
-    
-    timesteps = TRAINING_METRICS['timesteps']
-    
-    # Plot 1: Action Entropy over time
-    if TRAINING_METRICS['action_entropy']:
-        axes[0, 0].plot(timesteps[:len(TRAINING_METRICS['action_entropy'])], TRAINING_METRICS['action_entropy'], 'b-', linewidth=2)
-        axes[0, 0].set_xlabel('Training Steps')
-        axes[0, 0].set_ylabel('Action Entropy')
-        axes[0, 0].set_title('Action Entropy (Exploration Level)')
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Add interpretation
-        final_entropy = TRAINING_METRICS['action_entropy'][-1]
-        if final_entropy > 0.5:
-            axes[0, 0].text(0.02, 0.98, '✅ High exploration', transform=axes[0, 0].transAxes, 
-                           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
-        elif final_entropy > 0.1:
-            axes[0, 0].text(0.02, 0.98, '🟡 Moderate exploration', transform=axes[0, 0].transAxes, 
-                           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
-        else:
-            axes[0, 0].text(0.02, 0.98, '🔴 Low exploration', transform=axes[0, 0].transAxes, 
-                           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
-    else:
-        axes[0, 0].text(0.5, 0.5, 'No entropy data', ha='center', va='center', transform=axes[0, 0].transAxes)
-        axes[0, 0].set_title('Action Entropy (No Data)')
-    
-    # Plot 2: Policy Loss over time
-    if TRAINING_METRICS['policy_loss']:
-        axes[0, 1].plot(timesteps[:len(TRAINING_METRICS['policy_loss'])], TRAINING_METRICS['policy_loss'], 'r-', linewidth=2)
-        axes[0, 1].set_xlabel('Training Steps')
-        axes[0, 1].set_ylabel('Policy Loss')
-        axes[0, 1].set_title('Policy Gradient Loss')
-        axes[0, 1].grid(True, alpha=0.3)
-    else:
-        axes[0, 1].text(0.5, 0.5, 'No policy loss data', ha='center', va='center', transform=axes[0, 1].transAxes)
-        axes[0, 1].set_title('Policy Loss (No Data)')
-    
-    # Plot 3: Value Loss over time
-    if TRAINING_METRICS['value_loss']:
-        axes[1, 0].plot(timesteps[:len(TRAINING_METRICS['value_loss'])], TRAINING_METRICS['value_loss'], 'g-', linewidth=2)
-        axes[1, 0].set_xlabel('Training Steps')
-        axes[1, 0].set_ylabel('Value Loss')
-        axes[1, 0].set_title('Value Function Loss')
-        axes[1, 0].grid(True, alpha=0.3)
-    else:
-        axes[1, 0].text(0.5, 0.5, 'No value loss data', ha='center', va='center', transform=axes[1, 0].transAxes)
-        axes[1, 0].set_title('Value Loss (No Data)')
-    
-    # Plot 4: Combined losses
-    axes[1, 1].set_title('Combined Training Losses')
-    if TRAINING_METRICS['policy_loss'] and TRAINING_METRICS['value_loss']:
-        min_len = min(len(TRAINING_METRICS['policy_loss']), len(TRAINING_METRICS['value_loss']))
-        axes[1, 1].plot(timesteps[:min_len], TRAINING_METRICS['policy_loss'][:min_len], 'r-', linewidth=2, label='Policy Loss')
-        axes[1, 1].plot(timesteps[:min_len], TRAINING_METRICS['value_loss'][:min_len], 'g-', linewidth=2, label='Value Loss')
-        axes[1, 1].legend()
-        axes[1, 1].set_xlabel('Training Steps')
-        axes[1, 1].set_ylabel('Loss')
-        axes[1, 1].grid(True, alpha=0.3)
-    else:
-        axes[1, 1].text(0.5, 0.5, 'Insufficient loss data', ha='center', va='center', transform=axes[1, 1].transAxes)
-    
-    plt.tight_layout()
-    plt.savefig('ppo_training_metrics.png', dpi=300, bbox_inches='tight')
-    print("✅ Training metrics plot saved: ppo_training_metrics.png")
-    plt.show()
-    
-    # Print summary statistics
-    if TRAINING_METRICS['action_entropy']:
-        entropy_data = TRAINING_METRICS['action_entropy']
-        print(f"\nAction Entropy Statistics:")
-        print(f"  Initial: {entropy_data[0]:.4f}")
-        print(f"  Final: {entropy_data[-1]:.4f}")
-        print(f"  Mean: {np.mean(entropy_data):.4f}")
-        print(f"  Std: {np.std(entropy_data):.4f}")
-        
-        # Entropy trend analysis
-        if len(entropy_data) > 10:
-            early_entropy = np.mean(entropy_data[:len(entropy_data)//4])
-            late_entropy = np.mean(entropy_data[-len(entropy_data)//4:])
-            entropy_change = ((late_entropy - early_entropy) / early_entropy) * 100
-            
-            print(f"  Early training avg: {early_entropy:.4f}")
-            print(f"  Late training avg: {late_entropy:.4f}")
-            print(f"  Change: {entropy_change:+.1f}%")
-            
-            if entropy_change < -50:
-                print("  🔴 WARNING: Entropy dropped significantly - may indicate premature convergence")
-            elif entropy_change < -20:
-                print("  🟡 CAUTION: Entropy decreased - normal but monitor for exploitation vs exploration balance")
-            else:
-                print("  ✅ Entropy maintained reasonably well")
-    
-    print("=" * 50)
 
 def analyze_training_arrival_distribution():
     """
@@ -1667,9 +2312,8 @@ def evaluate_static_on_dynamic(static_model, jobs_data, machine_list, arrival_ti
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 15 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 15 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -1715,9 +2359,8 @@ def evaluate_static_on_static(static_model, jobs_data, machine_list, reward_mode
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -1828,9 +2471,8 @@ def evaluate_perfect_knowledge_on_scenario(perfect_model, jobs_data, machine_lis
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -2072,30 +2714,18 @@ def _generic_heuristic(jobs_data, machine_list, arrival_times, heuristic_name, p
         
         if not available_ops:
             # No operations available, advance time to next event
-            next_events = []
+            next_time = float('inf')
+            for job_id in jobs_data.keys():
+                if job_next_op[job_id] < len(jobs_data[job_id]):
+                    op_idx = job_next_op[job_id]
+                    job_ready_time = arrival_times[job_id]
+                    if op_idx > 0:
+                        job_ready_time = max(job_ready_time, job_op_end_times[job_id][op_idx - 1])
+                    next_time = min(next_time, job_ready_time)
             
-            # Next machine available time
-            for m, next_free in machine_next_free.items():
-                if next_free > sim_time:
-                    next_events.append(next_free)
-            
-            # Next job arrival
-            for job_id, arr_time in arrival_times.items():
-                if job_id not in arrived_jobs and arr_time > sim_time:
-                    next_events.append(arr_time)
-            
-            # Next operation ready time
-            for job_id in arrived_jobs:
-                next_op = next_operation_for_job[job_id]
-                if next_op > 0 and next_op < len(jobs_data[job_id]):
-                    ready_time = operation_end_times[job_id][next_op - 1]
-                    if ready_time > sim_time:
-                        next_events.append(ready_time)
-            
-            if next_events:
-                sim_time = min(next_events)
-            else:
+            if next_time == float('inf'):
                 break
+            sim_time = next_time
             continue
         
         # Enhanced priority function that considers machine availability
@@ -2309,7 +2939,9 @@ def plot_gantt(schedule, machines, title="Schedule", save_path=None):
 
         for op_data in machine_ops:
             if len(op_data) >= 3:
-                job_op, start_time, end_time = op_data[:3]
+                job_op = op_data[0]
+                start_time = op_data[1]
+                end_time = op_data[2]
                 duration = end_time - start_time
                 
                 # Extract job number for coloring
@@ -2505,8 +3137,6 @@ def main():
     print("=" * 80)
     print(f"Problem: {len(ENHANCED_JOBS_DATA)} jobs, {len(MACHINE_LIST)} machines")
     print("Research Question: Does Dynamic RL outperform Static RL on Poisson arrivals?")
-    print(f"🔧 REPRODUCIBILITY: Fixed seed {GLOBAL_SEED} for all random components")
-    print("📊 DEBUGGING: Action entropy & training metrics tracking enabled")
     print("=" * 80)
     arrival_rate = 0.5  # HIGHER arrival rate to create more dynamic scenarios
     # With λ=0.5, expected inter-arrival = 2 time units (faster than most job operations)
@@ -2566,10 +3196,8 @@ def main():
                                      reward_mode="makespan_increment")
 
     # Analyze arrival time distribution during training
-    print("\n3.5. TRAINING ANALYSIS")
-    analyze_first_10_episodes()  # Show detailed first 10 episodes
-    plot_training_metrics()      # Show PPO exploration metrics
-    analyze_training_arrival_distribution()  # Show overall distribution
+    print("\n3.5. TRAINING ARRIVAL DISTRIBUTION ANALYSIS")
+    analyze_training_arrival_distribution()
     
     # Step 4: Evaluate all methods on the same test scenario
     print("\n4. EVALUATION PHASE")
@@ -2683,6 +3311,7 @@ def main():
     # Static RL comparison: dynamic vs static scenarios
     if static_static_makespan < static_dynamic_makespan:
         improvement = ((static_dynamic_makespan - static_static_makespan) / static_dynamic_makespan) * 100
+       
         print(f"✓ Static RL performs {improvement:.1f}% better on static scenarios (as expected)")
     else:
         gap = ((static_static_makespan - static_dynamic_makespan) / static_static_makespan) * 100
@@ -2765,7 +3394,9 @@ def main():
             
             for op_data in machine_ops:
                 if len(op_data) >= 3:
-                    job_op, start_time, end_time = op_data[:3]
+                    job_op = op_data[0]
+                    start_time = op_data[1]
+                    end_time = op_data[2]
                     duration = end_time - start_time
                     
                     # Extract job number for coloring
@@ -2773,19 +3404,19 @@ def main():
                     if 'J' in job_op:
                         try:
                             job_num = int(job_op.split('J')[1].split('-')[0])
-                        except (ValueError, IndexError):
+                        except:
                             job_num = 0
-                    
+                
                     color = colors[job_num % len(colors)]
                     
                     ax.barh(idx, duration, left=start_time, height=0.6, 
                            color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
-                    
+                
                     # Add operation label
                     if duration > 1:  # Only add text if bar is wide enough
                         ax.text(start_time + duration/2, idx, job_op, 
                                ha='center', va='center', fontsize=8, fontweight='bold')
-        
+
         # Add red arrows for job arrivals (only for dynamic jobs that arrive > 0)
         if arrival_times:
             arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
@@ -2888,7 +3519,9 @@ def main():
             
             for op_data in machine_ops:
                 if len(op_data) >= 3:
-                    job_op, start_time, end_time = op_data[:3]
+                    job_op = op_data[0]
+                    start_time = op_data[1]
+                    end_time = op_data[2]
                     duration = end_time - start_time
                     
                     # Extract job number for coloring
@@ -2903,7 +3536,7 @@ def main():
                     
                     ax.barh(idx, duration, left=start_time, height=0.6, 
                            color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
-                    
+                
                     # Add operation label
                     if duration > 1:  # Only add text if bar is wide enough
                         ax.text(start_time + duration/2, idx, job_op, 
@@ -2996,6 +3629,3 @@ def main():
         print(f"• Performance hierarchy: {'✅ Expected' if perfect_makespan <= dynamic_makespan <= static_dynamic_makespan else '❌ Unexpected'}")
         print(f"• Static RL scenario comparison: {'✅ Better on static' if static_static_makespan < static_dynamic_makespan else '❌ Needs investigation'}")
     print("=" * 80)
-
-if __name__ == "__main__":
-    main()

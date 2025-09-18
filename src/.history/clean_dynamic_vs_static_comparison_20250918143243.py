@@ -459,7 +459,7 @@ class PoissonDynamicFJSPEnv(gym.Env):
         if episode_arrivals:
             TRAINING_ARRIVAL_TIMES.extend(episode_arrivals)
         
-        # Debug: Track first 10 episodes in detail (silently)
+        # Debug: Track first 10 episodes in detail
         if TRAINING_EPISODE_COUNT <= 10:
             episode_debug_info = {
                 'episode': TRAINING_EPISODE_COUNT,
@@ -470,6 +470,18 @@ class PoissonDynamicFJSPEnv(gym.Env):
                 'dynamic_arrivals': sorted(episode_arrivals) if episode_arrivals else []
             }
             DEBUG_EPISODE_ARRIVALS.append(episode_debug_info)
+            
+            print(f"\n=== EPISODE {TRAINING_EPISODE_COUNT} DYNAMIC ARRIVALS DEBUG ===")
+            print(f"Initial jobs (t=0): {sorted(self.initial_job_ids)}")
+            print(f"Dynamic jobs: {sorted(self.dynamic_job_ids)}")
+            print(f"Arrival schedule:")
+            for job_id in sorted(self.job_arrival_times.keys()):
+                arr_time = self.job_arrival_times[job_id]
+                status = "INITIAL" if job_id in self.initial_job_ids else ("DYNAMIC" if arr_time != float('inf') else "NO ARRIVAL")
+                arr_str = f"t={arr_time:.1f}" if arr_time != float('inf') else "∞"
+                print(f"  Job {job_id}: {arr_str} ({status})")
+            print(f"Jobs available at start: {sorted(self.arrived_jobs)}")
+            print("=" * 50)
         
         return self._get_observation(), {}
 
@@ -761,10 +773,10 @@ class TrainingCallback:
             
             TRAINING_METRICS['timesteps'].append(model.num_timesteps)
             
-            # Suppress periodic entropy updates during training for cleaner output
-            # if len(TRAINING_METRICS['action_entropy']) > 0 and len(TRAINING_METRICS['action_entropy']) % 10 == 0:
-            #     recent_entropy = TRAINING_METRICS['action_entropy'][-1]
-            #     print(f"  {self.method_name} - Step {model.num_timesteps}: Action Entropy = {recent_entropy:.4f}")
+            # Print periodic entropy updates
+            if len(TRAINING_METRICS['action_entropy']) > 0 and len(TRAINING_METRICS['action_entropy']) % 10 == 0:
+                recent_entropy = TRAINING_METRICS['action_entropy'][-1]
+                print(f"  {self.method_name} - Step {model.num_timesteps}: Action Entropy = {recent_entropy:.4f}")
         
         return True
 
@@ -1667,9 +1679,8 @@ def evaluate_static_on_dynamic(static_model, jobs_data, machine_list, arrival_ti
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 15 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 15 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -1715,9 +1726,8 @@ def evaluate_static_on_static(static_model, jobs_data, machine_list, reward_mode
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -1828,9 +1838,8 @@ def evaluate_perfect_knowledge_on_scenario(perfect_model, jobs_data, machine_lis
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     

@@ -761,10 +761,10 @@ class TrainingCallback:
             
             TRAINING_METRICS['timesteps'].append(model.num_timesteps)
             
-            # Suppress periodic entropy updates during training for cleaner output
-            # if len(TRAINING_METRICS['action_entropy']) > 0 and len(TRAINING_METRICS['action_entropy']) % 10 == 0:
-            #     recent_entropy = TRAINING_METRICS['action_entropy'][-1]
-            #     print(f"  {self.method_name} - Step {model.num_timesteps}: Action Entropy = {recent_entropy:.4f}")
+            # Print periodic entropy updates
+            if len(TRAINING_METRICS['action_entropy']) > 0 and len(TRAINING_METRICS['action_entropy']) % 10 == 0:
+                recent_entropy = TRAINING_METRICS['action_entropy'][-1]
+                print(f"  {self.method_name} - Step {model.num_timesteps}: Action Entropy = {recent_entropy:.4f}")
         
         return True
 
@@ -1667,9 +1667,8 @@ def evaluate_static_on_dynamic(static_model, jobs_data, machine_list, arrival_ti
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 15 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 15 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -1715,9 +1714,8 @@ def evaluate_static_on_static(static_model, jobs_data, machine_list, reward_mode
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     
@@ -1828,9 +1826,8 @@ def evaluate_perfect_knowledge_on_scenario(perfect_model, jobs_data, machine_lis
         obs, reward, done, truncated, info = test_env.step(action)
         step_count += 1
         
-        # Suppress step-by-step evaluation output for cleaner display
-        # if step_count % 10 == 0:
-        #     print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
+        if step_count % 10 == 0:
+            print(f"    Step {step_count}: current_makespan = {test_env.env.current_makespan:.2f}")
     
     makespan = test_env.env.current_makespan
     

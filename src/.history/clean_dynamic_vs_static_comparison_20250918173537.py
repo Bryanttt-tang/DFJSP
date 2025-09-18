@@ -87,13 +87,13 @@ class StaticFJSPEnv(gym.Env):
             min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
         )
         
-        # SAME observation space as PerfectKnowledgeFJSPEnv
+        # Minimal observation space for fully observed MDP
         obs_size = (
-            len(self.machines) +                    # Machine availability
-            self.num_jobs * self.max_ops_per_job +  # Operation completion
-            self.num_jobs +                         # Job progress  
-            self.num_jobs +                         # Job arrival status (all arrived at t=0)
-            1                                       # Current makespan
+            len(self.machines) +                    # Machine time-until-free
+            self.num_jobs +                         # Next operation for each job
+            self.num_jobs +                         # Job next-op-ready-time
+            1 +                                     # Current makespan/time
+            self.num_jobs                           # Job arrival times (static: all 0)
         )
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
@@ -253,9 +253,9 @@ class StaticFJSPEnv(gym.Env):
                 makespan_increment = current_makespan - previous_makespan
                 reward = -makespan_increment  # Negative increment
                 
-                # Add completion bonus
-                if done:
-                    reward += 50.0
+                # # Add completion bonus
+                # if done:
+                #     reward += 50.0
                     
                 return reward
             else:
@@ -268,49 +268,83 @@ class StaticFJSPEnv(gym.Env):
             return reward
 
     def _get_observation(self):
-        """Generate observation - same structure as PerfectKnowledgeFJSPEnv."""
-        norm_factor = max(self.current_makespan, 1.0)
+        """
+        Generate minimal observation for fully observed MDP.
+        
+        Components:
+        1. Machine time-until-free (relative to current time)
+        2. Next operation for each job
+        3. Job next-operation-ready-time (relative to current time)
+        4. Current makespan/time (normalized)
+        5. Job arrival times (static: all 0)
+        """
         obs = []
         
-        # Machine availability (normalized by current makespan)
-        for m in self.machines:
-            value = float(self.machine_next_free.get(m, 0.0)) / norm_factor
-            obs.append(max(0.0, min(1.0, value)))
+        # Estimate time scale for consistent normalization
+        all_proc_times = []
+        for job_data in self.jobs.values():
+            for op in job_data:
+                all_proc_times.extend(op['proc_times'].values())
         
-        # Operation completion status (padded to max_ops_per_job)
-        for job_id in self.job_ids:
-            for op_idx in range(self.max_ops_per_job):
-                if op_idx < len(self.jobs[job_id]):
-                    completed = 1.0 if self.completed_ops[job_id][op_idx] else 0.0
-                else:
-                    completed = 1.0  # Non-existent operations considered completed
-                obs.append(float(completed))
+        if all_proc_times:
+            time_scale = max(np.mean(all_proc_times) * 10, 1.0)  # 10x avg proc time as scale
+        else:
+            time_scale = 50.0  # Fallback
         
-        # Job progress (proportion of operations completed)
+        current_time = self.current_makespan
+        
+        # 1. Machine time-until-free (relative timing, normalized)
+        for machine in self.machines:
+            time_until_free = max(0.0, self.machine_next_free[machine] - current_time)
+            normalized_time = min(1.0, time_until_free / time_scale)
+            obs.append(normalized_time)
+        
+        # 2. Next operation for each job (normalized by max_ops_per_job)
         for job_id in self.job_ids:
+            next_op = self.next_operation[job_id]
             total_ops = len(self.jobs[job_id])
             if total_ops > 0:
-                progress = float(self.next_operation[job_id]) / float(total_ops)
+                normalized_next_op = float(next_op) / float(self.max_ops_per_job)
             else:
-                progress = 1.0
-            obs.append(max(0.0, min(1.0, progress)))
+                normalized_next_op = 1.0  # Job has no operations
+            obs.append(min(1.0, normalized_next_op))
         
-        # Job arrival status (all jobs arrived at t=0 for static environment)
+        # 3. Job next-operation-ready-time (relative to current time, normalized)
         for job_id in self.job_ids:
-            obs.append(1.0)  # All jobs are available (arrived at t=0)
+            next_op_idx = self.next_operation[job_id]
             
-        # Current makespan (normalized)
-        makespan_norm = float(self.current_makespan) / 100.0  # Assume max makespan around 100
-        obs.append(max(0.0, min(1.0, makespan_norm)))
+            if next_op_idx < len(self.jobs[job_id]):
+                # Job has more operations
+                if next_op_idx == 0:
+                    # First operation: ready when job arrives
+                    job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+                else:
+                    # Later operation: ready when previous operation completes
+                    job_ready_time = self.operation_end_times[job_id][next_op_idx - 1]
+                
+                time_until_ready = max(0.0, job_ready_time - current_time)
+                normalized_ready_time = min(1.0, time_until_ready / time_scale)
+                obs.append(normalized_ready_time)
+            else:
+                # Job completed: no more operations
+                obs.append(0.0)
         
-        # Pad or truncate to match observation space
+        # 4. Current makespan/time (normalized)
+        normalized_makespan = min(1.0, current_time / time_scale)
+        obs.append(normalized_makespan)
+        
+        # 5. Job arrival times (static: all jobs arrive at t=0)
+        for job_id in self.job_ids:
+            # For static environment, all arrival times are 0
+            obs.append(0.0)
+        
+        # Ensure correct size and format
         target_size = self.observation_space.shape[0]
         if len(obs) < target_size:
             obs.extend([0.0] * (target_size - len(obs)))
         elif len(obs) > target_size:
             obs = obs[:target_size]
         
-        # Ensure proper format
         obs_array = np.array(obs, dtype=np.float32)
         obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
         
@@ -382,13 +416,13 @@ class PoissonDynamicFJSPEnv(gym.Env):
             min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
         )
         
-        # USE SAME OBSERVATION SPACE as successful environments
+        # Minimal observation space for fully observed MDP
         obs_size = (
-            len(self.machines) +                    # Machine availability
-            self.num_jobs * self.max_ops_per_job +  # Operation completion status
-            self.num_jobs +                         # Job progress ratios  
-            self.num_jobs +                         # Job arrival status
-            1                                       # Current makespan
+            len(self.machines) +                    # Machine time-until-free
+            self.num_jobs +                         # Next operation for each job
+            self.num_jobs +                         # Job next-op-ready-time
+            1 +                                     # Current makespan/time
+            self.num_jobs                           # Job arrival times (dynamic)
         )
         
         self.observation_space = spaces.Box(
@@ -616,13 +650,13 @@ class PoissonDynamicFJSPEnv(gym.Env):
                 makespan_increment = current_makespan - previous_makespan
                 reward = -makespan_increment  # Negative increment
                 
-                # Small bonus for utilizing newly arrived jobs (dynamic advantage)
-                if num_new_arrivals > 0:
-                    reward += 5.0 * num_new_arrivals
+                # # Small bonus for utilizing newly arrived jobs (dynamic advantage)
+                # if num_new_arrivals > 0:
+                #     reward += 5.0 * num_new_arrivals
                 
-                # Add completion bonus
-                if done:
-                    reward += 50.0
+                # # Add completion bonus
+                # if done:
+                #     reward += 50.0
                     
                 return reward
             else:
@@ -636,54 +670,89 @@ class PoissonDynamicFJSPEnv(gym.Env):
 
     def _get_observation(self):
         """
-        Simplified observation similar to successful PerfectKnowledgeFJSPEnv.
-        Focus on essential information without over-complication.
+        Generate minimal observation for fully observed MDP.
+        
+        Components:
+        1. Machine time-until-free (relative to current time)
+        2. Next operation for each job
+        3. Job next-operation-ready-time (relative to current time)
+        4. Current makespan/time (normalized)
+        5. Job arrival times (dynamic: actual arrival times)
         """
-        norm_factor = max(self.current_makespan, 1.0)
         obs = []
         
-        # Machine availability (normalized by current makespan)
-        for m in self.machines:
-            value = float(self.machine_next_free.get(m, 0.0)) / norm_factor
-            obs.append(max(0.0, min(1.0, value)))
+        # Estimate time scale for consistent normalization
+        all_proc_times = []
+        for job_data in self.jobs.values():
+            for op in job_data:
+                all_proc_times.extend(op['proc_times'].values())
         
-        # Operation completion status (padded to max_ops_per_job)
-        for job_id in self.job_ids:
-            for op_idx in range(self.max_ops_per_job):
-                if op_idx < len(self.jobs[job_id]):
-                    completed = 1.0 if self.completed_ops[job_id][op_idx] else 0.0
-                else:
-                    completed = 1.0  # Non-existent operations considered completed
-                obs.append(float(completed))
+        if all_proc_times:
+            time_scale = max(np.mean(all_proc_times) * 10, 1.0)  # 10x avg proc time as scale
+        else:
+            time_scale = 50.0  # Fallback
         
-        # Job progress (proportion of operations completed)
+        current_time = self.current_makespan
+        
+        # 1. Machine time-until-free (relative timing, normalized)
+        for machine in self.machines:
+            time_until_free = max(0.0, self.machine_next_free[machine] - current_time)
+            normalized_time = min(1.0, time_until_free / time_scale)
+            obs.append(normalized_time)
+        
+        # 2. Next operation for each job (normalized by max_ops_per_job)
         for job_id in self.job_ids:
+            next_op = self.next_operation[job_id]
             total_ops = len(self.jobs[job_id])
             if total_ops > 0:
-                progress = float(self.next_operation[job_id]) / float(total_ops)
+                normalized_next_op = float(next_op) / float(self.max_ops_per_job)
             else:
-                progress = 1.0
-            obs.append(max(0.0, min(1.0, progress)))
+                normalized_next_op = 1.0  # Job has no operations
+            obs.append(min(1.0, normalized_next_op))
         
-        # Job arrival status (simple binary: arrived or not)
+        # 3. Job next-operation-ready-time (relative to current time, normalized)
         for job_id in self.job_ids:
-            if job_id in self.arrived_jobs:
-                obs.append(1.0)  # Job is available
-            else:
-                obs.append(0.0)  # Job not yet arrived
+            next_op_idx = self.next_operation[job_id]
             
-        # Current makespan (normalized)
-        makespan_norm = float(self.current_makespan) / 100.0  # Assume max makespan around 100
-        obs.append(max(0.0, min(1.0, makespan_norm)))
+            if next_op_idx < len(self.jobs[job_id]):
+                # Job has more operations
+                if next_op_idx == 0:
+                    # First operation: ready when job arrives
+                    job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+                else:
+                    # Later operation: ready when previous operation completes
+                    job_ready_time = self.operation_end_times[job_id][next_op_idx - 1]
+                
+                time_until_ready = max(0.0, job_ready_time - current_time)
+                normalized_ready_time = min(1.0, time_until_ready / time_scale)
+                obs.append(normalized_ready_time)
+            else:
+                # Job completed: no more operations
+                obs.append(0.0)
         
-        # Pad or truncate to match observation space
+        # 4. Current makespan/time (normalized)
+        normalized_makespan = min(1.0, current_time / time_scale)
+        obs.append(normalized_makespan)
+        
+        # 5. Job arrival times (dynamic: normalized arrival times relative to current time)
+        for job_id in self.job_ids:
+            arrival_time = self.job_arrival_times.get(job_id, 0.0)
+            if arrival_time == float('inf'):
+                # Job won't arrive in this episode
+                obs.append(1.0)  # Use max value to indicate "very far future"
+            else:
+                # Time until job arrives (or 0 if already arrived)
+                time_until_arrival = max(0.0, arrival_time - current_time)
+                normalized_arrival = min(1.0, time_until_arrival / time_scale)
+                obs.append(normalized_arrival)
+        
+        # Ensure correct size and format
         target_size = self.observation_space.shape[0]
         if len(obs) < target_size:
             obs.extend([0.0] * (target_size - len(obs)))
         elif len(obs) > target_size:
             obs = obs[:target_size]
         
-        # Ensure proper format
         obs_array = np.array(obs, dtype=np.float32)
         obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
         
@@ -913,13 +982,13 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
             min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
         )
         
-        # Observation space - similar to test3_backup.py
+        # Minimal observation space matching other environments
         obs_size = (
-            len(self.machines) +                    # Machine availability
-            self.num_jobs * self.max_ops_per_job +  # Operation completion
-            self.num_jobs +                         # Job progress  
-            self.num_jobs +                         # Job arrival status
-            1                                       # Current makespan
+            len(self.machines) +                    # Machine time-until-free
+            self.num_jobs +                         # Next operation for each job
+            self.num_jobs +                         # Job next-op-ready-time
+            1 +                                     # Current makespan/time
+            self.num_jobs                           # Job arrival times (perfect knowledge)
         )
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
@@ -1087,9 +1156,9 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
                 makespan_increment = current_makespan - previous_makespan
                 reward = -makespan_increment  # Negative increment (reward for not increasing makespan)
                 
-                # Add small completion bonus
-                if done:
-                    reward += 50.0
+                # # Add small completion bonus
+                # if done:
+                #     reward += 50.0
                     
                 return reward
             else:
@@ -1118,36 +1187,80 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
             return reward
     
     def _get_observation(self):
-        """Generate observation - same structure as test3_backup.py"""
-        norm_factor = max(self.current_makespan, 1.0)
+        """
+        Generate minimal observation for fully observed MDP.
+        
+        Components:
+        1. Machine time-until-free (relative to current time)
+        2. Next operation for each job
+        3. Job next-operation-ready-time (relative to current time)
+        4. Current makespan/time (normalized)
+        5. Job arrival times (perfect knowledge: exact arrival times)
+        """
         obs = []
         
-        # Machine availability
-        for m in self.machines:
-            obs.append(self.machine_next_free[m] / norm_factor)
+        # Estimate time scale for consistent normalization
+        all_proc_times = []
+        for job_data in self.jobs.values():
+            for op in job_data:
+                all_proc_times.extend(op['proc_times'].values())
         
-        # Operation completion status
-        for job_id in self.job_ids:
-            ops_status = self.completed_ops[job_id]
-            while len(ops_status) < self.max_ops_per_job:
-                ops_status.append(True)  # Pad with completed
-            for status in ops_status[:self.max_ops_per_job]:
-                obs.append(1.0 if status else 0.0)
+        if all_proc_times:
+            time_scale = max(np.mean(all_proc_times) * 10, 1.0)  # 10x avg proc time as scale
+        else:
+            time_scale = 50.0  # Fallback
         
-        # Job progress
+        current_time = self.current_makespan
+        
+        # 1. Machine time-until-free (relative timing, normalized)
+        for machine in self.machines:
+            time_until_free = max(0.0, self.machine_next_free[machine] - current_time)
+            normalized_time = min(1.0, time_until_free / time_scale)
+            obs.append(normalized_time)
+        
+        # 2. Next operation for each job (normalized by max_ops_per_job)
         for job_id in self.job_ids:
-            completed = sum(self.completed_ops[job_id])
-            total = len(self.jobs[job_id])
-            obs.append(completed / max(1, total))
+            next_op = self.next_operation[job_id]
+            total_ops = len(self.jobs[job_id])
+            if total_ops > 0:
+                normalized_next_op = float(next_op) / float(self.max_ops_per_job)
+            else:
+                normalized_next_op = 1.0  # Job has no operations
+            obs.append(min(1.0, normalized_next_op))
+        
+        # 3. Job next-operation-ready-time (relative to current time, normalized)
+        for job_id in self.job_ids:
+            next_op_idx = self.next_operation[job_id]
             
-        # Job arrival status
-        for job_id in self.job_ids:
-            obs.append(1.0 if job_id in self.arrived_jobs else 0.0)
-            
-        # Current makespan
-        obs.append(self.current_makespan / norm_factor)
+            if next_op_idx < len(self.jobs[job_id]):
+                # Job has more operations
+                if next_op_idx == 0:
+                    # First operation: ready when job arrives
+                    job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+                else:
+                    # Later operation: ready when previous operation completes
+                    job_ready_time = self.operation_end_times[job_id][next_op_idx - 1]
+                
+                time_until_ready = max(0.0, job_ready_time - current_time)
+                normalized_ready_time = min(1.0, time_until_ready / time_scale)
+                obs.append(normalized_ready_time)
+            else:
+                # Job completed: no more operations
+                obs.append(0.0)
         
-        # Ensure correct size
+        # 4. Current makespan/time (normalized)
+        normalized_makespan = min(1.0, current_time / time_scale)
+        obs.append(normalized_makespan)
+        
+        # 5. Job arrival times (perfect knowledge: normalized arrival times relative to current time)
+        for job_id in self.job_ids:
+            arrival_time = self.job_arrival_times.get(job_id, 0.0)
+            # Time until job arrives (or 0 if already arrived)
+            time_until_arrival = max(0.0, arrival_time - current_time)
+            normalized_arrival = min(1.0, time_until_arrival / time_scale)
+            obs.append(normalized_arrival)
+        
+        # Ensure correct size and format
         target_size = self.observation_space.shape[0]
         if len(obs) < target_size:
             obs.extend([0.0] * (target_size - len(obs)))
@@ -1204,8 +1317,8 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
         "MlpPolicy",
         vec_env,
         verbose=0,
-        learning_rate=3e-4,        # Match PerfectKnowledgeFJSPEnv
-        n_steps=2048,              # Match PerfectKnowledgeFJSPEnv  
+        learning_rate=1e-3,        # Match PerfectKnowledgeFJSPEnv
+        n_steps=2048,              # Match PerfectKnowledgeFJSPEnv
         batch_size=128,            # Match PerfectKnowledgeFJSPEnv
         n_epochs=10,               # Match PerfectKnowledgeFJSPEnv
         gamma=1,                   # Match PerfectKnowledgeFJSPEnv
@@ -1316,13 +1429,18 @@ def analyze_first_10_episodes():
     """
     global DEBUG_EPISODE_ARRIVALS
     
-    if not DEBUG_EPISODE_ARRIVALS:
-        print("No debug episode data recorded!")
-        return
-    
     print(f"\n" + "="*80)
     print("FIRST 10 EPISODES - DYNAMIC JOB ARRIVAL ANALYSIS")
     print("="*80)
+    print(f"Debug episodes recorded: {len(DEBUG_EPISODE_ARRIVALS)}")
+    
+    if not DEBUG_EPISODE_ARRIVALS:
+        print("❌ No debug episode data recorded!")
+        print("   This might be because:")
+        print("   - Dynamic RL training didn't complete")
+        print("   - Episode tracking wasn't properly initialized")  
+        print("   - All jobs arrived beyond time horizon")
+        return
     
     for episode_info in DEBUG_EPISODE_ARRIVALS:
         ep_num = episode_info['episode'] 
@@ -2514,9 +2632,9 @@ def main():
     # Step 1: Training Setup
     print("\n1. TRAINING SETUP")
     print("-" * 50)
-    perfect_timesteps = 50000    # Perfect knowledge needs less training
-    dynamic_timesteps = 50000   # Increased for better learning with integer timing  
-    static_timesteps = 50000    # Increased for better learning
+    perfect_timesteps = 100000    # Perfect knowledge needs less training
+    dynamic_timesteps = 100000   # Increased for better learning with integer timing  
+    static_timesteps = 100000    # Increased for better learning
     
     print(f"Perfect RL: {perfect_timesteps:,} | Dynamic RL: {dynamic_timesteps:,} | Static RL: {static_timesteps:,} timesteps")
     print(f"Arrival rate: {arrival_rate} (expected inter-arrival: {1/arrival_rate:.1f} time units)")
@@ -2568,8 +2686,8 @@ def main():
     # Analyze arrival time distribution during training
     print("\n3.5. TRAINING ANALYSIS")
     analyze_first_10_episodes()  # Show detailed first 10 episodes
-    plot_training_metrics()      # Show PPO exploration metrics
-    analyze_training_arrival_distribution()  # Show overall distribution
+    # plot_training_metrics()      # Show PPO exploration metrics
+    # analyze_training_arrival_distribution()  # Show overall distribution
     
     # Step 4: Evaluate all methods on the same test scenario
     print("\n4. EVALUATION PHASE")
