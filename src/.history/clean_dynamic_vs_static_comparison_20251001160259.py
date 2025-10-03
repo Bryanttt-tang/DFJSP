@@ -1,0 +1,3531 @@
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import collections
+import gymnasium as gym
+import torch
+from tqdm import tqdm
+import time
+from gymnasium import spaces
+from stable_baselines3.common.vec_env import DummyVecEnv
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+from pulp import LpProblem, LpMinimize, LpVariable, lpSum, PULP_CBC_CMD
+
+# Set random seed for reproducibility - CHANGED FOR FRESH TESTING
+GLOBAL_SEED = 12345  # Changed from 42 to force fresh results
+random.seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+torch.manual_seed(GLOBAL_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(GLOBAL_SEED)
+    torch.cuda.manual_seed_all(GLOBAL_SEED)
+
+# Global tracking for arrival time distribution analysis
+TRAINING_ARRIVAL_TIMES = []  # Track all arrival times during training
+TRAINING_EPISODE_COUNT = 0   # Track episode count
+DEBUG_EPISODE_ARRIVALS = []  # Track first 10 episodes' arrival details
+
+# Training metrics tracking - ENHANCED for detailed loss visualization
+TRAINING_METRICS = {
+    'episode_rewards': [],
+    'episode_lengths': [],
+    'action_entropy': [],
+    'policy_loss': [],
+    'value_loss': [],
+    'timesteps': [],
+    'episodes': [],  # Track episode numbers
+    'learning_rate': [],  # Track learning rate changes
+    'clip_fraction': []   # Track clipping fraction
+}
+
+# Agent-specific training metrics for comparison
+AGENT_TRAINING_METRICS = {
+    'Perfect Knowledge RL': {'policy_loss': [], 'value_loss': [], 'episodes': [], 'timesteps': []},
+    'Dynamic RL': {'policy_loss': [], 'value_loss': [], 'episodes': [], 'timesteps': []},
+    'Static RL': {'policy_loss': [], 'value_loss': [], 'episodes': [], 'timesteps': []}
+}
+
+# --- Expanded Job Data for Better Generalization ---
+# Exact dataset from test3_backup.py that achieved makespan=43 with dynamic RL
+ENHANCED_JOBS_DATA = collections.OrderedDict({
+    0: [{'proc_times': {'M0': 4, 'M1': 6}}, {'proc_times': {'M1': 5, 'M2': 3}}, {'proc_times': {'M0': 2}}],
+    1: [{'proc_times': {'M1': 7, 'M2': 5}}, {'proc_times': {'M0': 4}}, {'proc_times': {'M1': 3, 'M2': 4}}],
+    2: [{'proc_times': {'M0': 5, 'M2': 6}}, {'proc_times': {'M0': 3, 'M1': 4}}, {'proc_times': {'M2': 7}}],
+    3: [{'proc_times': {'M1': 8}}, {'proc_times': {'M2': 2}}, {'proc_times': {'M0': 5, 'M1': 6}}],
+    4: [{'proc_times': {'M0': 6, 'M1': 9}}, {'proc_times': {'M1': 7, 'M2': 5}}, {'proc_times': {'M0': 4}}, {'proc_times': {'M2': 6}}],
+    5: [{'proc_times': {'M1': 5, 'M2': 8}}, {'proc_times': {'M0': 6}}, {'proc_times': {'M1': 4, 'M2': 3}}],
+    6: [{'proc_times': {'M0': 7, 'M2': 4}}, {'proc_times': {'M0': 5, 'M1': 6}}, {'proc_times': {'M1': 3}}, {'proc_times': {'M0': 2, 'M2': 5}}],
+})
+
+# Deterministic arrival times - simplified integer values for better learning
+DETERMINISTIC_ARRIVAL_TIMES = {0: 0, 1: 0, 2: 0, 3: 8, 4: 12, 5: 16, 6: 20}
+
+MACHINE_LIST = ['M0', 'M1', 'M2']
+
+
+class StaticFJSPEnv(gym.Env):
+    """
+    Static FJSP Environment where all jobs are available at time 0.
+    Uses the same structure as PerfectKnowledgeFJSPEnv but with all arrival times = 0.
+    """
+    
+    def __init__(self, jobs_data, machine_list, reward_mode="makespan_increment", seed=None):
+        """Initialize with all jobs arriving at t=0."""
+        super().__init__()
+        
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            
+        self.jobs = jobs_data
+        self.machines = machine_list
+        self.job_ids = list(self.jobs.keys())
+        self.reward_mode = reward_mode
+        
+        # Create arrival times dict with all jobs at t=0 (static scenario)
+        self.job_arrival_times = {job_id: 0.0 for job_id in self.job_ids}
+        
+        # Environment parameters
+        self.num_jobs = len(self.job_ids)
+        self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
+        self.total_operations = sum(len(ops) for ops in self.jobs.values())
+        
+        # Use SAME action and observation spaces as PerfectKnowledgeFJSPEnv
+        self.action_space = spaces.Discrete(
+            min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
+        )
+        
+        # UNIFIED observation space (same size for all RL methods for evaluation compatibility)
+        obs_size = (
+            self.num_jobs +                         # Ready job indicators
+            len(self.machines) +                    # Machine idle status
+            self.num_jobs * len(self.machines) +    # Processing times for ready ops
+            self.num_jobs                      # Future arrival info (ZEROS for Static RL)
+            # self.num_jobs * len(self.machines)      # Future processing times (ZEROS for Static RL)
+        )
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+        )
+        
+        self._reset_state()
+    
+    def _reset_state(self):
+        """Reset the environment state - same as PerfectKnowledgeFJSPEnv."""
+        self.machine_next_free = {m: 0.0 for m in self.machines}
+        self.schedule = {m: [] for m in self.machines}
+        self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
+        self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
+        self.next_operation = {job_id: 0 for job_id in self.job_ids}
+        
+        self.current_makespan = 0.0
+        self.operations_scheduled = 0
+        self.episode_step = 0
+        self.max_episode_steps = self.total_operations * 2
+        
+        # Handle job arrivals - all jobs arrive at t=0 for static scenario
+        self.arrived_jobs = set(self.job_ids)  # All jobs available immediately
+        
+    def reset(self, seed=None, options=None):
+        """Reset environment - same as PerfectKnowledgeFJSPEnv."""
+        if seed is not None:
+            super().reset(seed=seed, options=options)
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        self._reset_state()
+        return self._get_observation(), {}
+
+    def _decode_action(self, action):
+        """Decode action - same as PerfectKnowledgeFJSPEnv."""
+        action = int(action) % self.action_space.n
+        num_machines = len(self.machines)
+        ops_per_job = self.max_ops_per_job
+        
+        job_idx = action // (ops_per_job * num_machines)
+        op_idx = (action % (ops_per_job * num_machines)) // num_machines
+        machine_idx = action % num_machines
+        
+        job_idx = min(job_idx, self.num_jobs - 1)
+        machine_idx = min(machine_idx, len(self.machines) - 1)
+        
+        return job_idx, op_idx, machine_idx
+
+    def _is_valid_action(self, job_idx, op_idx, machine_idx):
+        """Check if action is valid - same as PerfectKnowledgeFJSPEnv."""
+        if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
+            return False
+        
+        job_id = self.job_ids[job_idx]
+        
+        # Check if job has arrived (all jobs arrive at t=0 for static)
+        if job_id not in self.arrived_jobs:
+            return False
+            
+        # Check operation index validity
+        if not (0 <= op_idx < len(self.jobs[job_id])):
+            return False
+            
+        # Check if this is the next operation
+        if op_idx != self.next_operation[job_id]:
+            return False
+            
+        # Check machine compatibility
+        machine_name = self.machines[machine_idx]
+        if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
+            return False
+            
+        return True
+
+    def action_masks(self):
+        """Generate action masks - same as PerfectKnowledgeFJSPEnv."""
+        mask = np.full(self.action_space.n, False, dtype=bool)
+        
+        if self.operations_scheduled >= self.total_operations:
+            return mask
+
+        valid_action_count = 0
+        for job_idx, job_id in enumerate(self.job_ids):
+            if job_id not in self.arrived_jobs:
+                continue
+                
+            next_op_idx = self.next_operation[job_id]
+            if next_op_idx >= len(self.jobs[job_id]):
+                continue
+                
+            for machine_idx, machine in enumerate(self.machines):
+                if machine in self.jobs[job_id][next_op_idx]['proc_times']:
+                    action = job_idx * (self.max_ops_per_job * len(self.machines)) + next_op_idx * len(self.machines) + machine_idx
+                    if action < self.action_space.n:
+                        mask[action] = True
+                        valid_action_count += 1
+        
+        if valid_action_count == 0:
+            mask.fill(True)
+            
+        return mask
+    
+    def step(self, action):
+        """Step function - same as PerfectKnowledgeFJSPEnv."""
+        self.episode_step += 1
+        
+        # Safety check for infinite episodes
+        if self.episode_step >= self.max_episode_steps:
+            return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
+        
+        job_idx, op_idx, machine_idx = self._decode_action(action)
+
+        # Use softer invalid action handling like PerfectKnowledgeFJSPEnv
+        if not self._is_valid_action(job_idx, op_idx, machine_idx):
+            return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+
+        job_id = self.job_ids[job_idx]
+        machine = self.machines[machine_idx]
+        
+        # Calculate timing using PerfectKnowledgeFJSPEnv approach
+        machine_available_time = self.machine_next_free.get(machine, 0.0)
+        job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
+                         else self.job_arrival_times.get(job_id, 0.0))  # All jobs at t=0
+        
+        start_time = max(machine_available_time, job_ready_time)
+        proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
+        end_time = start_time + proc_time
+
+        # Update state
+        self.machine_next_free[machine] = end_time
+        self.operation_end_times[job_id][op_idx] = end_time
+        self.completed_ops[job_id][op_idx] = True
+        self.next_operation[job_id] += 1
+        self.operations_scheduled += 1
+        
+        # Update makespan - no need to check for new arrivals in static environment
+        previous_makespan = self.current_makespan
+        self.current_makespan = max(self.current_makespan, end_time)
+
+        # Record in schedule
+        self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+
+        # Check termination
+        terminated = self.operations_scheduled >= self.total_operations
+        
+        # Calculate reward using PerfectKnowledgeFJSPEnv style
+        idle_time = max(0, start_time - machine_available_time)
+        reward = self._calculate_reward(proc_time, idle_time, terminated, previous_makespan, self.current_makespan)
+        
+        info = {"makespan": self.current_makespan}
+        return self._get_observation(), reward, terminated, False, info
+
+    def _calculate_reward(self, proc_time, idle_time, done, previous_makespan=None, current_makespan=None):
+        """Reward calculation - same as PerfectKnowledgeFJSPEnv."""
+        if self.reward_mode == "makespan_increment":
+            if previous_makespan is not None and current_makespan is not None:
+                makespan_increment = current_makespan - previous_makespan
+                reward = -makespan_increment  # Negative increment
+                
+                # # Add completion bonus
+                # if done:
+                #     reward += 50.0
+                    
+                return reward
+            else:
+                return -proc_time
+        else:
+            # Default reward function
+            reward = 10.0 - proc_time * 0.1 - idle_time
+            if done:
+                reward += 100.0
+            return reward
+
+    def _get_observation(self):
+        """
+        EVENT-DRIVEN MINIMAL OBSERVATION for fully observed MDP.
+        
+        Only includes information needed for immediate assignment decision:
+        1. Which jobs have ready operations (available now)
+        2. Processing times for ready operations on each machine
+        3. Which machines are currently idle
+        """
+        obs = []
+        
+        # 1. Ready job indicators (binary: 1 if job has ready operation, 0 otherwise)
+        for job_id in self.job_ids:
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                # Job has arrived and has remaining operations
+                next_op_idx = self.next_operation[job_id]
+                
+                # Check if operation is ready (precedence satisfied)
+                if next_op_idx == 0:
+                    # First operation: ready if job has arrived
+                    job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+                    is_ready = self.current_makespan >= job_ready_time
+                else:
+                    # Later operation: ready if previous operation completed
+                    prev_completed = self.completed_ops[job_id][next_op_idx - 1]
+                    is_ready = prev_completed
+                
+                obs.append(1.0 if is_ready else 0.0)
+            else:
+                obs.append(0.0)  # Job not ready
+        
+        # 2. Machine idle status (binary: 1 if idle, 0 if busy)
+        for machine in self.machines:
+            machine_free_time = self.machine_next_free[machine]
+            is_idle = machine_free_time <= self.current_makespan
+            obs.append(1.0 if is_idle else 0.0)
+        
+        # 3. Processing times for ready operations (normalized)
+        max_proc_time = 10.0  # Reasonable upper bound for normalization
+        
+        for job_id in self.job_ids:
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                next_op_idx = self.next_operation[job_id]
+                operation = self.jobs[job_id][next_op_idx]
+                
+                # Add processing time for each machine (0 if incompatible)
+                for machine in self.machines:
+                    if machine in operation['proc_times']:
+                        proc_time = operation['proc_times'][machine]
+                        normalized_time = min(1.0, proc_time / max_proc_time)
+                        obs.append(normalized_time)
+                    else:
+                        obs.append(0.0)  # Machine cannot process this operation
+            else:
+                # Job not ready: add zeros for all machines
+                for machine in self.machines:
+                    obs.append(0.0)
+        
+        # 4. STATIC RL: No future arrival information (all zeros)
+        for job_id in self.job_ids:
+            obs.append(0.0)  # No future arrival info for Static RL
+        
+        # 5. STATIC RL: No future processing times (all zeros)
+        # for job_id in self.job_ids:
+        #     for machine in self.machines:
+        #         obs.append(0.0)  # No future processing info for Static RL
+        
+        # Ensure correct size and format
+        # target_size = self.observation_space.shape[0];
+        # if len(obs) < target_size:
+        #     obs.extend([0.0] * (target_size - len(obs)));
+        # elif len(obs) > target_size:
+        #     obs = obs[:target_size];
+        
+        obs_array = np.array(obs, dtype=np.float32)
+        obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        return obs_array
+
+    def render(self, mode='human'):
+        """Render the current state (optional)."""
+        if mode == 'human':
+            print(f"\n=== Static Environment - Makespan: {self.current_makespan:.2f} ===")
+            print(f"Completed operations: {self.operations_scheduled}")
+            print(f"Machine status:")
+            for m in self.machines:
+                print(f"  {m}: next free at {self.machine_next_free[m]:.2f}")
+
+
+class PoissonDynamicFJSPEnv(gym.Env):
+    """
+    Dynamic FJSP Environment with Poisson-distributed job arrivals.
+    FIXED to use the SAME structure as successful StaticFJSPEnv and PerfectKnowledgeFJSPEnv.
+    """
+    
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(self, jobs_data, machine_list, initial_jobs=5, arrival_rate=0.05, 
+                 max_time_horizon=200, reward_mode="makespan_increment", seed=None):
+        """
+        Initialize the Poisson Dynamic FJSP Environment.
+        
+        Args:
+            jobs_data: Dictionary of all possible jobs
+            machine_list: List of available machines
+            initial_jobs: Number of jobs available at start (default: 5)
+            arrival_rate: Poisson rate parameter (jobs per time unit, default: 0.1)
+            max_time_horizon: Maximum simulation time
+            reward_mode: Reward function type
+            seed: Random seed for reproducibility
+        """
+        super().__init__()
+        
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        self.jobs = jobs_data
+        self.machines = machine_list
+        self.job_ids = list(self.jobs.keys())
+        
+        # Handle initial_jobs as either integer or list
+        if isinstance(initial_jobs, list):
+            self.initial_job_ids = initial_jobs
+            self.dynamic_job_ids = [j for j in self.job_ids if j not in initial_jobs]
+            self.initial_jobs = len(initial_jobs)
+        else:
+            self.initial_jobs = min(initial_jobs, len(self.job_ids))
+            self.initial_job_ids = self.job_ids[:self.initial_jobs]
+            self.dynamic_job_ids = self.job_ids[self.initial_jobs:]
+        
+        self.arrival_rate = arrival_rate
+        self.max_time_horizon = max_time_horizon
+        self.reward_mode = reward_mode
+        
+        # Environment parameters
+        self.num_jobs = len(self.job_ids)
+        self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
+        self.total_operations = sum(len(ops) for ops in self.jobs.values())
+        
+        # USE SAME ACTION SPACE as successful environments (FIXED, not dynamic)
+        self.action_space = spaces.Discrete(
+            min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
+        )
+        
+        # UNIFIED observation space (same size for all RL methods for evaluation compatibility)
+        obs_size = (
+            self.num_jobs +                         # Ready job indicators
+            len(self.machines) +                    # Machine idle status
+            self.num_jobs * len(self.machines) +    # Processing times for ready ops
+            self.num_jobs                          # DYNAMIC ADVANTAGE: Future arrival delays
+            # self.num_jobs * len(self.machines)      # Future processing times (ZEROS for Dynamic RL)
+        )
+        
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+        )
+        
+        # Initialize state variables
+        self._reset_state()
+
+    def _reset_state(self):
+        """Reset all environment state variables - SAME as successful environments."""
+        self.machine_next_free = {m: 0.0 for m in self.machines}
+        self.schedule = {m: [] for m in self.machines}
+        self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
+        self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
+        self.next_operation = {job_id: 0 for job_id in self.job_ids}
+        
+        self.current_makespan = 0.0
+        self.operations_scheduled = 0
+        self.episode_step = 0
+        self.max_episode_steps = self.total_operations * 2
+        
+        # Job arrival management - simplified
+        self.arrived_jobs = set(self.initial_job_ids)  # Initial jobs available immediately
+        self.job_arrival_times = {}
+        
+        # Generate Poisson arrival times for dynamic jobs
+        self._generate_poisson_arrivals()
+
+    def _generate_poisson_arrivals(self):
+        """Generate arrival times for dynamic jobs using Poisson process - BACK TO INTEGERS."""
+        # Initialize arrival times
+        for job_id in self.initial_job_ids:
+            self.job_arrival_times[job_id] = 0.0
+        
+        # Generate inter-arrival times using exponential distribution
+        current_time = 0.0
+        for job_id in self.dynamic_job_ids:
+            inter_arrival_time = np.random.exponential(1.0 / self.arrival_rate)
+            current_time += inter_arrival_time
+            
+            # CHANGED BACK: Round to integers for simple, discrete time
+            if current_time <= self.max_time_horizon:
+                self.job_arrival_times[job_id] = float(round(current_time))  # Back to integer arrivals
+            else:
+                self.job_arrival_times[job_id] = float('inf')  # Won't arrive in this episode
+
+    def reset(self, seed=None, options=None):
+        """Reset the environment for a new episode - SAME structure as successful environments."""
+        global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT, DEBUG_EPISODE_ARRIVALS
+        
+        if seed is not None:
+            super().reset(seed=seed, options=options)
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        self._reset_state()
+        
+        # Track arrival times for analysis
+        TRAINING_EPISODE_COUNT += 1
+        episode_arrivals = []
+        for job_id, arr_time in self.job_arrival_times.items():
+            if arr_time != float('inf') and arr_time > 0:  # Only dynamic arrivals
+                episode_arrivals.append(arr_time)
+        
+        if episode_arrivals:
+            TRAINING_ARRIVAL_TIMES.extend(episode_arrivals)
+        
+        # Debug: Track first 10 episodes in detail (silently)
+        if TRAINING_EPISODE_COUNT <= 10:
+            episode_debug_info = {
+                'episode': TRAINING_EPISODE_COUNT,
+                'initial_jobs': sorted(self.initial_job_ids),
+                'dynamic_jobs': sorted(self.dynamic_job_ids),
+                'arrival_times': dict(self.job_arrival_times),
+                'arrived_at_reset': sorted(self.arrived_jobs),
+                'dynamic_arrivals': sorted(episode_arrivals) if episode_arrivals else []
+            }
+            DEBUG_EPISODE_ARRIVALS.append(episode_debug_info)
+        
+        return self._get_observation(), {}
+
+    def _decode_action(self, action):
+        """Decode action - SAME as successful environments."""
+        action = int(action) % self.action_space.n
+        num_machines = len(self.machines)
+        ops_per_job = self.max_ops_per_job
+        
+        job_idx = action // (ops_per_job * num_machines)
+        op_idx = (action % (ops_per_job * num_machines)) // num_machines
+        machine_idx = action % num_machines
+        
+        job_idx = min(job_idx, self.num_jobs - 1)
+        machine_idx = min(machine_idx, len(self.machines) - 1)
+        
+        return job_idx, op_idx, machine_idx
+
+    def _is_valid_action(self, job_idx, op_idx, machine_idx):
+        """Check if action is valid - SAME as successful environments."""
+        if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
+            return False
+        
+        job_id = self.job_ids[job_idx]
+        
+        # Check if job has arrived
+        if job_id not in self.arrived_jobs:
+            return False
+            
+        # Check operation index validity
+        if not (0 <= op_idx < len(self.jobs[job_id])):
+            return False
+            
+        # Check if this is the next operation
+        if op_idx != self.next_operation[job_id]:
+            return False
+            
+        # Check machine compatibility
+        machine_name = self.machines[machine_idx]
+        if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
+            return False
+            
+        return True
+
+    def action_masks(self):
+        """Generate action masks - SAME as successful environments."""
+        mask = np.full(self.action_space.n, False, dtype=bool)
+        
+        if self.operations_scheduled >= self.total_operations:
+            return mask
+
+        valid_action_count = 0
+        for job_idx, job_id in enumerate(self.job_ids):
+            if job_id not in self.arrived_jobs:
+                continue
+                
+            next_op_idx = self.next_operation[job_id]
+            if next_op_idx >= len(self.jobs[job_id]):
+                continue
+                
+            for machine_idx, machine in enumerate(self.machines):
+                if machine in self.jobs[job_id][next_op_idx]['proc_times']:
+                    action = job_idx * (self.max_ops_per_job * len(self.machines)) + next_op_idx * len(self.machines) + machine_idx
+                    if action < self.action_space.n:
+                        mask[action] = True
+                        valid_action_count += 1
+        
+        if valid_action_count == 0:
+            mask.fill(True)
+            
+        return mask
+
+    def step(self, action):
+        """Step function - SIMPLIFIED to match successful environments."""
+        self.episode_step += 1
+        
+        # Safety check for infinite episodes
+        if self.episode_step >= self.max_episode_steps:
+            return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
+        
+        job_idx, op_idx, machine_idx = self._decode_action(action)
+
+        # Use softer invalid action handling like successful environments
+        if not self._is_valid_action(job_idx, op_idx, machine_idx):
+            return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+
+        job_id = self.job_ids[job_idx]
+        machine = self.machines[machine_idx]
+        
+        # Calculate timing using successful environments' approach
+        machine_available_time = self.machine_next_free.get(machine, 0.0)
+        job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
+                         else self.job_arrival_times.get(job_id, 0.0))
+        
+        start_time = max(machine_available_time, job_ready_time)
+        proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
+        end_time = start_time + proc_time
+
+        # Update state
+        previous_makespan = self.current_makespan
+        self.machine_next_free[machine] = end_time
+        self.operation_end_times[job_id][op_idx] = end_time
+        self.completed_ops[job_id][op_idx] = True
+        self.next_operation[job_id] += 1
+        self.operations_scheduled += 1
+        
+        # Update makespan and check for new arrivals (key improvement)
+        self.current_makespan = max(self.current_makespan, end_time)
+        
+        # Check for newly arrived jobs (deterministic based on current makespan)
+        newly_arrived = []
+        for job_id_check, arrival_time in self.job_arrival_times.items():
+            if (job_id_check not in self.arrived_jobs and 
+                arrival_time <= self.current_makespan and 
+                arrival_time != float('inf')):
+                self.arrived_jobs.add(job_id_check)
+                newly_arrived.append(job_id_check)
+
+        # Record in schedule
+        self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+
+        # Check termination
+        terminated = self.operations_scheduled >= self.total_operations
+        
+        # SIMPLIFIED reward calculation matching successful environments
+        idle_time = max(0, start_time - machine_available_time)
+        reward = self._calculate_reward(proc_time, idle_time, terminated, 
+                                      previous_makespan, self.current_makespan, len(newly_arrived))
+        
+        info = {
+            "makespan": self.current_makespan,
+            "newly_arrived_jobs": len(newly_arrived),
+            "total_arrived_jobs": len(self.arrived_jobs)
+        }
+        
+        return self._get_observation(), reward, terminated, False, info
+
+    def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan, num_new_arrivals):
+        """SIMPLIFIED reward function matching successful environments."""
+        
+        if self.reward_mode == "makespan_increment":
+            # Use SAME reward structure as successful environments
+            if previous_makespan is not None and current_makespan is not None:
+                makespan_increment = current_makespan - previous_makespan
+                reward = -makespan_increment  # Negative increment
+                
+                # # Small bonus for utilizing newly arrived jobs (dynamic advantage)
+                # if num_new_arrivals > 0:
+                #     reward += 5.0 * num_new_arrivals
+                
+                # # Add completion bonus
+                # if done:
+                #     reward += 50.0
+                    
+                return reward
+            else:
+                return -proc_time
+        else:
+            # Default reward function matching successful environments
+            reward = 10.0 - proc_time * 0.1 - idle_time
+            if done:
+                reward += 100.0
+            return reward
+
+    def _get_observation(self):
+        """
+        EVENT-DRIVEN MINIMAL OBSERVATION for fully observed MDP.
+        
+        Only includes information needed for immediate assignment decision:
+        1. Which jobs have ready operations (available now)
+        2. Processing times for ready operations on each machine
+        3. Which machines are currently idle
+        
+        INCLUDES ARRIVAL TIME AWARENESS for dynamic advantage.
+        """
+        obs = []
+        
+        # 1. Ready job indicators (binary: 1 if job has ready operation, 0 otherwise)
+        for job_id in self.job_ids:
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                # Job has arrived and has remaining operations
+                next_op_idx = self.next_operation[job_id]
+                
+                # Check if operation is ready (precedence satisfied)
+                if next_op_idx == 0:
+                    # First operation: ready if job has arrived
+                    job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+                    is_ready = self.current_makespan >= job_ready_time
+                else:
+                    # Later operation: ready if previous operation completed
+                    prev_completed = self.completed_ops[job_id][next_op_idx - 1]
+                    is_ready = prev_completed
+                
+                obs.append(1.0 if is_ready else 0.0)
+            else:
+                obs.append(0.0)  # Job not ready or not arrived
+        
+        # 2. Machine idle status (binary: 1 if idle, 0 if busy)
+        for machine in self.machines:
+            machine_free_time = self.machine_next_free[machine]
+            is_idle = machine_free_time <= self.current_makespan
+            obs.append(1.0 if is_idle else 0.0)
+        
+        # 3. Processing times for ready operations (normalized)
+        max_proc_time = 10.0  # Reasonable upper bound for normalization
+        
+        for job_id in self.job_ids:
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                next_op_idx = self.next_operation[job_id]
+                operation = self.jobs[job_id][next_op_idx]
+                
+                # Add processing time for each machine (0 if incompatible)
+                for machine in self.machines:
+                    if machine in operation['proc_times']:
+                        proc_time = operation['proc_times'][machine]
+                        normalized_time = min(1.0, proc_time / max_proc_time)
+                        obs.append(normalized_time)
+                    else:
+                        obs.append(0.0)  # Machine cannot process this operation
+            else:
+                # Job not ready or arrived: add zeros for processing times
+                for machine in self.machines:
+                    obs.append(0.0)
+        
+        # 4. DYNAMIC RL ADVANTAGE: Future arrival time hints for unarrived jobs
+        for job_id in self.job_ids:
+            if job_id not in self.arrived_jobs:
+                # Job not arrived yet: provide arrival time hint
+                arrival_time = self.job_arrival_times.get(job_id, float('inf'))
+                if arrival_time != float('inf') and arrival_time <= self.current_makespan + 30:
+                    # Job will arrive soon: add normalized arrival delay
+                    delay = max(0, arrival_time - self.current_makespan)
+                    normalized_delay = min(1.0, delay / 30.0)  # Normalize by 30 time units
+                    obs.append(normalized_delay)
+                else:
+                    # Job won't arrive soon or ever: add zero
+                    obs.append(0.0)
+            else:
+                # Job already arrived: add zero (no future arrival)
+                obs.append(0.0)
+        
+        # 5. DYNAMIC RL: No future processing times (all zeros - this advantage reserved for Perfect RL)
+        # for job_id in self.job_ids:
+        #     for machine in self.machines:
+        #         obs.append(0.0)  # No future processing info for Dynamic RL
+        
+        # Ensure correct size and format
+        # target_size = self.observation_space.shape[0]
+        # if len(obs) < target_size:
+        #     obs.extend([0.0] * (target_size - len(obs)))
+        # elif len(obs) > target_size:
+        #     obs = obs[:target_size]
+        
+        obs_array = np.array(obs, dtype=np.float32)
+        obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        return obs_array
+
+    def render(self, mode='human'):
+        """Render the current state (optional)."""
+        if mode == 'human':
+            print(f"\n=== Time: {self.current_makespan:.2f} ===")
+            print(f"Arrived jobs: {sorted(self.arrived_jobs)}")
+            print(f"Completed operations: {self.operations_scheduled}")
+            print(f"Machine status:")
+            for m in self.machines:
+                print(f"  {m}: next free at {self.machine_next_free[m]:.2f}")
+
+
+def mask_fn(env):
+    """Mask function for ActionMasker wrapper"""
+    return env.action_masks()
+
+# --- Import Environment Classes ---
+# Import the already working environment classes
+# exec(open('dynamic_poisson_fjsp.py').read())
+
+class TrainingCallback:
+    """Enhanced callback to track detailed training metrics including losses."""
+    
+    def __init__(self, method_name):
+        self.method_name = method_name
+        self.step_count = 0
+        self.episode_count = 0
+        self.last_logged_episode = -1
+        
+    def __call__(self, locals_dict, globals_dict):
+        global TRAINING_METRICS, AGENT_TRAINING_METRICS
+        
+        # Extract PPO model from locals
+        model = locals_dict.get('self')
+        
+        if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
+            log_data = model.logger.name_to_value
+            
+            # Track episode count
+            if 'rollout/ep_len_mean' in log_data:
+                current_episode = model.num_timesteps // (model.n_steps if hasattr(model, 'n_steps') else 2048)
+                if current_episode > self.last_logged_episode:
+                    self.episode_count = current_episode
+                    self.last_logged_episode = current_episode
+            
+            # Log losses with episode tracking
+            if 'train/policy_gradient_loss' in log_data:
+                policy_loss = log_data['train/policy_gradient_loss']
+                TRAINING_METRICS['policy_loss'].append(policy_loss)
+                AGENT_TRAINING_METRICS[self.method_name]['policy_loss'].append(policy_loss)
+                AGENT_TRAINING_METRICS[self.method_name]['episodes'].append(self.episode_count)
+                AGENT_TRAINING_METRICS[self.method_name]['timesteps'].append(model.num_timesteps)
+                
+            if 'train/value_loss' in log_data:
+                value_loss = log_data['train/value_loss']
+                TRAINING_METRICS['value_loss'].append(value_loss)
+                AGENT_TRAINING_METRICS[self.method_name]['value_loss'].append(value_loss)
+            
+            # Log additional metrics
+            if 'train/entropy_loss' in log_data:
+                TRAINING_METRICS['action_entropy'].append(log_data['train/entropy_loss'])
+            
+            if 'train/learning_rate' in log_data:
+                TRAINING_METRICS['learning_rate'].append(log_data['train/learning_rate'])
+                
+            if 'train/clip_fraction' in log_data:
+                TRAINING_METRICS['clip_fraction'].append(log_data['train/clip_fraction'])
+            
+            TRAINING_METRICS['timesteps'].append(model.num_timesteps)
+            TRAINING_METRICS['episodes'].append(self.episode_count)
+        
+        return True
+
+def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_timesteps=100000, reward_mode="makespan_increment", learning_rate=3e-4):
+    """
+    Train a perfect knowledge RL agent using the same approach as test3_backup.py.
+    
+    Key insight: Train on deterministic arrival times (like the test scenario)
+    rather than trying to create a complex "perfect knowledge" environment.
+    This matches the working approach from test3_backup.py.
+    
+    IMPORTANT: Each Perfect Knowledge RL is trained specifically for ONE scenario
+    with the exact arrival times, making it the optimal RL benchmark for that scenario.
+    """
+    print(f"    Training arrival times: {arrival_times}")
+    print(f"    Timesteps: {total_timesteps:,} | Reward: {reward_mode}")
+    
+    def make_perfect_env():
+        # Use PerfectKnowledgeFJSPEnv for both training and evaluation consistency
+        env = PerfectKnowledgeFJSPEnv(jobs_data, machine_list, arrival_times, reward_mode=reward_mode)
+        env = ActionMasker(env, mask_fn)
+        return env
+
+    vec_env = DummyVecEnv([make_perfect_env])
+    
+    # IDENTICAL hyperparameters across all RL methods for fair comparison
+    model = MaskablePPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=0,
+        learning_rate=learning_rate,        # IDENTICAL across all RL methods
+        n_steps=2048,              # IDENTICAL across all RL methods
+        batch_size=128,            # IDENTICAL across all RL methods
+        n_epochs=10,               # IDENTICAL across all RL methods
+        gamma=0.99,                # IDENTICAL across all RL methods (changed from 1.0)
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,             # IDENTICAL across all RL methods
+        vf_coef=0.5,
+        max_grad_norm=0.5,     
+        policy_kwargs=dict(
+            net_arch=[256, 256, 128],  # IDENTICAL across all RL methods
+            activation_fn=torch.nn.ReLU
+        )
+    )
+    
+    # Training with progress bar and entropy tracking (silent)
+    print(f"    Training perfect knowledge agent for this specific scenario...")
+    callback = TrainingCallback("Perfect Knowledge RL")
+    
+    # Training with progress tracking for Perfect Knowledge
+    print(f"    Starting training...")
+    
+    # Do a quick evaluation before training to establish baseline
+    test_env = PerfectKnowledgeFJSPEnv(jobs_data, machine_list, arrival_times, reward_mode=reward_mode)
+    test_env = ActionMasker(test_env, mask_fn)
+    obs, _ = test_env.reset()
+    
+    # Quick random baseline test
+    random_makespan = 0
+    try:
+        random_steps = 0
+        done = False
+        while not done and random_steps < 200:  # Increased steps for late arrivals
+            action_masks = test_env.action_masks()
+            if not any(action_masks):
+                # Check if we need to advance time to next arrival (same logic as evaluation)
+                current_time = test_env.env.current_makespan
+                next_arrival_time = min([t for t in arrival_times.values() 
+                                       if t > current_time and t != float('inf')] + [float('inf')])
+                
+                if next_arrival_time != float('inf'):
+                    test_env.env.current_makespan = next_arrival_time
+                    # Check for newly arrived jobs
+                    newly_arrived = []
+                    for job_id_check, arrival_time in test_env.env.job_arrival_times.items():
+                        if (job_id_check not in test_env.env.arrived_jobs and 
+                            arrival_time <= test_env.env.current_makespan and 
+                            arrival_time != float('inf')):
+                            test_env.env.arrived_jobs.add(job_id_check)
+                            newly_arrived.append(job_id_check)
+                    if newly_arrived:
+                        obs = test_env.env._get_observation()
+                        continue
+                break
+            # Random valid action
+            valid_actions = [i for i, mask in enumerate(action_masks) if mask]
+            if valid_actions:
+                action = np.random.choice(valid_actions)
+                obs, reward, done, truncated, info = test_env.step(action)
+                random_steps += 1
+        random_makespan = test_env.env.current_makespan
+        print(f"    Random baseline makespan: {random_makespan:.2f}")
+    except:
+        print(f"    Could not establish random baseline")
+    
+    # Train with progress tracking and tqdm bar
+    callback = TrainingCallback("Perfect Knowledge RL")
+    
+    with tqdm(total=total_timesteps, desc=f"Perfect Knowledge RL", 
+              bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
+        
+        def combined_callback(locals_dict, globals_dict):
+            callback(locals_dict, globals_dict)
+            if hasattr(model, 'num_timesteps'):
+                pbar.n = model.num_timesteps
+                pbar.refresh()
+            return True
+        
+        model.learn(total_timesteps=total_timesteps, callback=combined_callback)
+    
+    # More thorough post-training evaluation
+    test_env.reset()
+    post_training_makespan = 999.0
+    try:
+        obs, _ = test_env.reset()
+        done = False
+        steps = 0
+        max_eval_steps = 200  # Standard evaluation steps
+        
+        while not done and steps < max_eval_steps:
+            action_masks = test_env.action_masks()
+            if not any(action_masks):
+                break
+            action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
+            obs, reward, done, truncated, info = test_env.step(action)
+            steps += 1
+        post_training_makespan = test_env.env.current_makespan
+        print(f"    Post-training makespan: {post_training_makespan:.2f}")
+        
+        if post_training_makespan < random_makespan:
+            improvement = random_makespan - post_training_makespan
+            print(f"    ✅ Training improved by {improvement:.2f} ({improvement/random_makespan*100:.1f}%)")
+        else:
+            degradation = post_training_makespan - random_makespan
+            print(f"    ⚠️  Training did not improve (random: {random_makespan:.2f}, trained: {post_training_makespan:.2f})")
+            print(f"    ⚠️  Degradation: {degradation:.2f} - may need longer training or different hyperparameters")
+    except Exception as e:
+        print(f"    ⚠️  Could not evaluate post-training: {e}")
+    
+    print(f"    ✅ Perfect knowledge training completed for this scenario!")
+    return model
+
+def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_mode="makespan_increment", learning_rate=3e-4):
+    """Train a static RL agent where all jobs are available at t=0."""
+    print(f"\n--- Training Static RL Agent on {len(jobs_data)} jobs ---")
+    print(f"Timesteps: {total_timesteps:,} | Reward: {reward_mode}")
+    
+    # CORRECTED: Use PerfectKnowledgeFJSPEnv with all arrival times = 0 for static scenario
+    static_arrival_times = {job_id: 0.0 for job_id in jobs_data.keys()}
+    
+    def make_static_env():
+        env = PerfectKnowledgeFJSPEnv(jobs_data, machine_list, static_arrival_times, reward_mode=reward_mode)
+        env = ActionMasker(env, mask_fn)
+        return env
+
+    vec_env = DummyVecEnv([make_static_env])
+    
+    # IDENTICAL hyperparameters as Perfect Knowledge RL for fair comparison
+    model = MaskablePPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=0,  # Minimal output
+        learning_rate=learning_rate,
+        n_steps=2048,              # IDENTICAL across all RL methods
+        batch_size=128,            # IDENTICAL across all RL methods (was 256)
+        n_epochs=10,               # IDENTICAL across all RL methods (no special case for late arrivals)
+        gamma=0.99,                # IDENTICAL across all RL methods (changed from 1.0)
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,             # IDENTICAL across all RL methods
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        seed=GLOBAL_SEED,          # Ensure reproducibility
+        policy_kwargs=dict(
+            net_arch=[256, 256, 128],  # IDENTICAL across all RL methods
+            activation_fn=torch.nn.ReLU
+        )
+    )
+    
+    print(f"Training Static RL for {total_timesteps:,} timesteps with seed {GLOBAL_SEED}...")
+    
+    # Train with tqdm progress bar and entropy tracking
+    start_time = time.time()
+    callback = TrainingCallback("Static RL")
+    
+    with tqdm(total=total_timesteps, desc="Static RL Training", 
+              bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
+        
+        def combined_callback(locals_dict, globals_dict):
+            callback(locals_dict, globals_dict)
+            if hasattr(model, 'num_timesteps'):
+                pbar.n = model.num_timesteps
+                pbar.refresh()
+            return True
+        
+        model.learn(total_timesteps=total_timesteps, callback=combined_callback)
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    print(f"✅ Static RL training completed in {training_time:.1f}s!")
+    
+    return model
+
+class PerfectKnowledgeFJSPEnv(gym.Env):
+    """
+    Dynamic FJSP Environment with PERFECT knowledge of specific arrival times.
+    
+    This environment is based on the working DynamicFJSPEnv from test3_backup.py
+    but uses deterministic arrival times instead of dynamic arrivals.
+    """
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(self, jobs_data, machine_list, arrival_times, reward_mode="makespan_increment"):
+        super().__init__()
+        self.jobs = jobs_data
+        self.machines = machine_list
+        self.job_ids = list(self.jobs.keys())
+        self.num_jobs = len(self.job_ids)
+        self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
+        self.total_operations = sum(len(ops) for ops in self.jobs.values())
+        self.reward_mode = reward_mode
+        self.job_arrival_times = arrival_times.copy()
+        
+        # Action space - similar to test3_backup.py
+        self.action_space = spaces.Discrete(
+            min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
+        )
+        
+        # EVENT-DRIVEN observation space with PERFECT KNOWLEDGE advantage
+        obs_size = (
+            self.num_jobs +                         # Ready job indicators
+            len(self.machines) +                    # Machine idle status
+            self.num_jobs * len(self.machines) +    # Processing times for ready ops
+            self.num_jobs                          # PERFECT ADVANTAGE: Exact future arrival times
+            # self.num_jobs * len(self.machines)      # PERFECT ADVANTAGE: Future job processing times
+        )
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+        )
+        
+    def reset(self, seed=None, options=None):
+        """Reset environment - based on test3_backup.py approach."""
+        if seed is not None:
+            super().reset(seed=seed, options=options)
+            random.seed(seed)
+            np.random.seed(seed)
+        
+        # Initialize state similar to test3_backup.py DynamicFJSPEnv
+        self.machine_next_free = {m: 0.0 for m in self.machines}
+        self.schedule = {m: [] for m in self.machines}
+        self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
+        self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
+        self.next_operation = {job_id: 0 for job_id in self.job_ids}
+        
+        self.current_makespan = 0.0
+        self.operations_scheduled = 0
+        self.episode_step = 0
+        self.max_episode_steps = self.total_operations * 2
+        
+        # Handle job arrivals at time 0 - deterministic
+        self.arrived_jobs = {
+            job_id for job_id, arrival_time in self.job_arrival_times.items()
+            if arrival_time <= 0
+        }
+        
+        return self._get_observation(), {}
+
+    def _decode_action(self, action):
+        """Decode action - same as test3_backup.py"""
+        action = int(action) % self.action_space.n
+        num_machines = len(self.machines)
+        ops_per_job = self.max_ops_per_job
+        
+        job_idx = action // (ops_per_job * num_machines)
+        op_idx = (action % (ops_per_job * num_machines)) // num_machines
+        machine_idx = action % num_machines
+        
+        job_idx = min(job_idx, self.num_jobs - 1)
+        machine_idx = min(machine_idx, len(self.machines) - 1)
+        
+        return job_idx, op_idx, machine_idx
+
+    def _is_valid_action(self, job_idx, op_idx, machine_idx):
+        """Check if action is valid - same as test3_backup.py"""
+        if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
+            return False
+        
+        job_id = self.job_ids[job_idx]
+        
+        # Check if job has arrived
+        if job_id not in self.arrived_jobs:
+            return False
+            
+        # Check operation index validity
+        if not (0 <= op_idx < len(self.jobs[job_id])):
+            return False
+            
+        # Check if this is the next operation
+        if op_idx != self.next_operation[job_id]:
+            return False
+            
+        # Check machine compatibility
+        machine_name = self.machines[machine_idx]
+        if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
+            return False
+            
+        return True
+
+    def action_masks(self):
+        """Generate action masks - same as test3_backup.py"""
+        mask = np.full(self.action_space.n, False, dtype=bool)
+        
+        if self.operations_scheduled >= self.total_operations:
+            return mask
+
+        valid_action_count = 0
+        for job_idx, job_id in enumerate(self.job_ids):
+            if job_id not in self.arrived_jobs:
+                continue
+            next_op_idx = self.next_operation[job_id]
+            if next_op_idx >= len(self.jobs[job_id]):
+                continue
+                
+            for machine_idx, machine in enumerate(self.machines):
+                if machine in self.jobs[job_id][next_op_idx]['proc_times']:
+                    action = (job_idx * self.max_ops_per_job * len(self.machines) + 
+                             next_op_idx * len(self.machines) + machine_idx)
+                    if action < self.action_space.n:
+                        mask[action] = True
+                        valid_action_count += 1
+        
+        if valid_action_count == 0:
+            mask.fill(True)
+            
+        return mask
+
+    def step(self, action):
+        """Step function - improved version based on test3_backup.py"""
+        self.episode_step += 1
+        
+        # Safety check for infinite episodes
+        if self.episode_step >= self.max_episode_steps:
+            return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
+        
+        job_idx, op_idx, machine_idx = self._decode_action(action)
+
+        # Use softer invalid action handling like test3_backup.py
+        if not self._is_valid_action(job_idx, op_idx, machine_idx):
+            # Give a negative reward but don't terminate - helps learning
+            return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+
+        job_id = self.job_ids[job_idx]
+        machine = self.machines[machine_idx]
+        
+        # Calculate timing using test3_backup.py approach
+        machine_available_time = self.machine_next_free.get(machine, 0.0)
+        job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
+                         else self.job_arrival_times.get(job_id, 0.0))
+        
+        start_time = max(machine_available_time, job_ready_time)
+        proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
+        end_time = start_time + proc_time
+
+        # Update state
+        previous_makespan = self.current_makespan
+        self.machine_next_free[machine] = end_time
+        self.operation_end_times[job_id][op_idx] = end_time
+        self.completed_ops[job_id][op_idx] = True
+        self.next_operation[job_id] += 1
+        self.operations_scheduled += 1
+        
+        # Update makespan and check for new arrivals (key improvement)
+        self.current_makespan = max(self.current_makespan, end_time)
+        
+        # Check for newly arrived jobs (deterministic)
+        newly_arrived = []
+        for job_id_check, arrival_time in self.job_arrival_times.items():
+            if (job_id_check not in self.arrived_jobs and 
+                arrival_time <= self.current_makespan and 
+                arrival_time != float('inf')):
+                self.arrived_jobs.add(job_id_check)
+                newly_arrived.append(job_id_check)
+
+        # Record in schedule
+        self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+
+        # Check termination
+        terminated = self.operations_scheduled >= self.total_operations
+        
+        # Calculate reward using test3_backup.py style
+        idle_time = max(0, start_time - machine_available_time)
+        reward = self._calculate_reward(proc_time, idle_time, terminated, 
+                                      previous_makespan, self.current_makespan)
+        
+        info = {"makespan": self.current_makespan}
+        return self._get_observation(), reward, terminated, False, info
+
+    def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan):
+        """Reward calculation based on test3_backup.py approach"""
+        if self.reward_mode == "makespan_increment":
+            # R(s_t, a_t) = E(t) - E(t+1) = negative increment in makespan
+            if previous_makespan is not None and current_makespan is not None:
+                makespan_increment = current_makespan - previous_makespan
+                reward = -makespan_increment  # Negative increment (reward for not increasing makespan)
+                
+                # # Add small completion bonus
+                # if done:
+                #     reward += 50.0
+                    
+                return reward
+            else:
+                # Fallback if makespan values not provided
+                return -proc_time
+        else:
+            # Improved reward function with better guidance
+            reward = 0.0
+            
+            # Strong positive reward for completing an operation
+            reward += 20.0
+            
+            # Small penalty for processing time (encourage shorter operations)
+            reward -= proc_time * 0.1
+            
+            # Penalty for idle time (encourage efficiency)  
+            reward -= idle_time * 1.0
+            
+            # Large completion bonus
+            if done:
+                reward += 200.0
+                # Bonus for shorter makespan
+                if current_makespan and current_makespan > 0:
+                    reward += max(0, 500.0 / current_makespan)
+            
+            return reward
+    
+    def _get_observation(self):
+        """
+        EVENT-DRIVEN MINIMAL OBSERVATION for fully observed MDP.
+        
+        Only includes information needed for immediate assignment decision:
+        1. Which jobs have ready operations (available now)
+        2. Processing times for ready operations on each machine
+        3. Which machines are currently idle
+        
+        PERFECT KNOWLEDGE VERSION: Includes complete future arrival information.
+        """
+        obs = []
+        
+        # 1. Ready job indicators (binary: 1 if job has ready operation, 0 otherwise)
+        for job_id in self.job_ids:
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                # Job has arrived and has remaining operations
+                next_op_idx = self.next_operation[job_id]
+                
+                # Check if operation is ready (precedence satisfied)
+                if next_op_idx == 0:
+                    # First operation: ready if job has arrived
+                    job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+                    is_ready = self.current_makespan >= job_ready_time
+                else:
+                    # Later operation: ready if previous operation completed
+                    prev_completed = self.completed_ops[job_id][next_op_idx - 1]
+                    is_ready = prev_completed
+                
+                obs.append(1.0 if is_ready else 0.0)
+            else:
+                obs.append(0.0)  # Job not ready or not arrived
+        
+        # 2. Machine idle status (binary: 1 if idle, 0 if busy)
+        for machine in self.machines:
+            machine_free_time = self.machine_next_free[machine]
+            is_idle = machine_free_time <= self.current_makespan
+            obs.append(1.0 if is_idle else 0.0)
+        
+        # 3. Processing times for ready operations (normalized)
+        max_proc_time = 10.0  # Reasonable upper bound for normalization
+        
+        for job_id in self.job_ids:
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                next_op_idx = self.next_operation[job_id]
+                operation = self.jobs[job_id][next_op_idx]
+                
+                # Add processing time for each machine (0 if incompatible)
+                for machine in self.machines:
+                    if machine in operation['proc_times']:
+                        proc_time = operation['proc_times'][machine]
+                        normalized_time = min(1.0, proc_time / max_proc_time)
+                        obs.append(normalized_time)
+                    else:
+                        obs.append(0.0)  # Machine cannot process this operation
+            else:
+                # Job not ready or arrived: add zeros for processing times
+                for machine in self.machines:
+                    obs.append(0.0)
+        
+        # 4. PERFECT KNOWLEDGE ADVANTAGE: Exact future arrival times
+        for job_id in self.job_ids:
+            if job_id not in self.arrived_jobs:
+                # Job not arrived yet: provide exact arrival time
+                arrival_time = self.job_arrival_times.get(job_id, float('inf'))
+                if arrival_time != float('inf'):
+                    # Job will arrive: provide exact arrival time information
+                    delay = max(0, arrival_time - self.current_makespan)
+                    normalized_delay = min(1.0, delay / 50.0)  # Normalize by 50 time units (longer horizon)
+                    obs.append(normalized_delay)
+                else:
+                    # Job won't arrive: add zero
+                    obs.append(0.0)
+            else:
+                # Job already arrived: add zero (no future arrival)
+                obs.append(0.0)
+        
+        # 5. PERFECT KNOWLEDGE ADVANTAGE: Processing times for future jobs' first operations
+        # for job_id in self.job_ids:
+        #     if job_id not in self.arrived_jobs and len(self.jobs[job_id]) > 0:
+        #         # Job not arrived yet: provide first operation processing times for planning
+        #         first_op = self.jobs[job_id][0]
+        #         for machine in self.machines:
+        #             if machine in first_op['proc_times']:
+        #                 proc_time = first_op['proc_times'][machine]
+        #                 normalized_proc = min(1.0, proc_time / max_proc_time)
+        #                 obs.append(normalized_proc)
+        #             else:
+        #                 obs.append(0.0)  # Machine cannot process this operation
+        #     else:
+        #         # Job already arrived or no operations: add zeros
+        #         for machine in self.machines:
+        #             obs.append(0.0)
+        
+        # Ensure correct size and format
+        # target_size = self.observation_space.shape[0]
+        # if len(obs) < target_size:
+        #     obs.extend([0.0] * (target_size - len(obs)))
+        # elif len(obs) > target_size:
+        #     obs = obs[:target_size]
+        
+        obs_array = np.array(obs, dtype=np.float32)
+        obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        return obs_array
+
+
+def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.08, total_timesteps=500000, reward_mode="makespan_increment", learning_rate=3e-4):
+    """
+    Train a dynamic RL agent on Poisson job arrivals with EXPANDED DATASET.
+    """
+    print(f"\n--- Training Dynamic RL Agent on {len(jobs_data)} jobs ---")
+    print(f"Timesteps: {total_timesteps:,} | Reward: {reward_mode}")
+    
+    def make_dynamic_env():
+        env = PoissonDynamicFJSPEnv(
+            jobs_data, machine_list, 
+            initial_jobs=initial_jobs,
+            arrival_rate=arrival_rate,
+            reward_mode=reward_mode,
+            seed=GLOBAL_SEED+100,  # Ensure reproducibility
+            max_time_horizon=200  # Standard time horizon
+        )
+        env = ActionMasker(env, mask_fn)
+        return env
+
+    vec_env = DummyVecEnv([make_dynamic_env])
+    
+    # IDENTICAL hyperparameters across all RL methods for fair comparison
+    model = MaskablePPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=0,
+        learning_rate=learning_rate,        # IDENTICAL across all RL methods
+        n_steps=2048,              # IDENTICAL across all RL methods
+        batch_size=128,            # IDENTICAL across all RL methods
+        n_epochs=10,               # IDENTICAL across all RL methods
+        gamma=0.99,                # IDENTICAL across all RL methods
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,             # IDENTICAL across all RL methods
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        seed=GLOBAL_SEED,          # Ensure reproducibility
+        policy_kwargs=dict(
+            net_arch=[256, 256, 128],  # IDENTICAL across all RL methods
+            activation_fn=torch.nn.ReLU
+        )
+    )
+    
+    print(f"Training Dynamic RL for {total_timesteps:,} timesteps with seed {GLOBAL_SEED}...")
+    print(f"Using IDENTICAL hyperparameters across all RL methods for fair comparison")
+    
+    # Train with progress bar like PerfectKnowledgeFJSPEnv
+    start_time = time.time()
+    callback = TrainingCallback("Dynamic RL")
+    
+    with tqdm(total=total_timesteps, desc="Dynamic RL Training", 
+              bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
+        def combined_callback(locals_dict, globals_dict):
+            callback(locals_dict, globals_dict)
+            if hasattr(model, 'num_timesteps'):
+                pbar.n = model.num_timesteps
+                pbar.refresh()
+            return True
+        
+        model.learn(total_timesteps=total_timesteps, callback=combined_callback)
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    print(f"✅ Dynamic RL training completed in {training_time:.1f}s!")
+    
+    return model
+
+def generate_test_scenarios(jobs_data, initial_jobs=[0, 1, 2, 3, 4], arrival_rate=0.08, num_scenarios=10):
+    """
+    Generate diverse test scenarios with expanded job set.
+    Uses different seeds from training to test generalizability.
+    """
+    print(f"Generating {num_scenarios} test scenarios from {len(jobs_data)} total jobs...")
+    print(f"Using test seeds 5000-{5000+num_scenarios-1} (different from training seed {GLOBAL_SEED})")
+    
+    scenarios = []
+    for i in range(num_scenarios):
+        test_seed = GLOBAL_SEED+1 + i  # Changed from 1000 to 5000 range for fresh test scenarios
+        np.random.seed(test_seed)  # Different from GLOBAL_SEED=12345 used in training
+        random.seed(test_seed)
+        arrival_times = {}
+        
+        # Use consistent initial jobs across all test scenarios
+        # Only vary the dynamic job arrival times to isolate the impact of arrivals
+        current_initial = initial_jobs
+        
+        # Initial jobs arrive at t=0
+        for job_id in current_initial:
+            arrival_times[job_id] = 0.0
+        
+        # Generate Poisson arrivals for remaining jobs
+        remaining_jobs = [j for j in jobs_data.keys() if j not in current_initial]
+        current_time = 0.0
+        
+        for job_id in remaining_jobs:
+            inter_arrival_time = np.random.exponential(1.0 / arrival_rate)
+            current_time += inter_arrival_time
+            
+            # CHANGED BACK: Use integer values for arrival times instead of float values
+            # This provides simpler, discrete time scheduling for better learning
+            if current_time <= 300:  # Extended time horizon for larger job set
+                arrival_times[job_id] = round(current_time)  # Back to integer arrivals
+            else:
+                arrival_times[job_id] = float('inf')  # Won't arrive
+        
+        scenarios.append({
+            'scenario_id': i,
+            'arrival_times': arrival_times,
+            'initial_jobs': current_initial,
+            'arrival_rate':arrival_rate,
+            'seed': test_seed
+        })
+        
+        arrived_jobs = [j for j, t in arrival_times.items() if t < float('inf')]
+        print(f"  Scenario {i+1}: {len(arrived_jobs)} jobs, rate={arrival_rate:.3f}")
+        print(f"    Initial: {current_initial}")
+        print(f"    Arrivals: {len(arrived_jobs) - len(current_initial)} jobs")
+    
+    return scenarios
+
+
+def plot_training_losses_comparison():
+    """
+    Plot training losses (policy and value) for all agents over time.
+    This provides insights into the learning dynamics and convergence of each agent.
+    """
+    global AGENT_TRAINING_METRICS
+    
+    print(f"\n=== TRAINING LOSSES COMPARISON ===")
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+    fig.suptitle('PPO Training Losses Comparison - Perfect Knowledge RL vs Dynamic RL vs Static RL', fontsize=16, fontweight='bold')
+    
+    # Plot 1: Policy Loss over time
+    for agent_name, metrics in AGENT_TRAINING_METRICS.items():
+        if metrics['policy_loss']:
+            axes[0].plot(metrics['timesteps'], metrics['policy_loss'], linewidth=2, label=agent_name)
+    
+    axes[0].set_xlabel('Training Steps')
+    axes[0].set_ylabel('Policy Loss')
+    axes[0].set_title('Policy Gradient Loss')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot 2: Value Loss over time
+    for agent_name, metrics in AGENT_TRAINING_METRICS.items():
+        if metrics['value_loss']:
+            axes[1].plot(metrics['timesteps'], metrics['value_loss'], linewidth=2, label=agent_name)
+    
+    axes[1].set_xlabel('Training Steps')
+    axes[1].set_ylabel('Value Loss')
+    axes[1].set_title('Value Function Loss')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('ppo_training_losses_comparison.png', dpi=300, bbox_inches='tight')
+    print("✅ Training losses comparison plot saved: ppo_training_losses_comparison.png")
+    plt.show()
+
+def plot_individual_agent_training(agent_name):
+    """
+    Plot training metrics (policy and value loss) for a specific agent over time.
+    This helps debug and analyze the learning behavior of each agent.
+    """
+    global AGENT_TRAINING_METRICS
+    
+    if agent_name not in AGENT_TRAINING_METRICS:
+        print(f"No training metrics found for {agent_name}")
+        return
+    
+    metrics = AGENT_TRAINING_METRICS[agent_name]
+    
+    if not metrics['policy_loss'] and not metrics['value_loss']:
+        print(f"No policy or value loss data for {agent_name}")
+        return
+    
+    print(f"\n=== {agent_name} TRAINING METRICS ===")
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+    fig.suptitle(f'{agent_name} - PPO Training Metrics', fontsize=16, fontweight='bold')
+    
+    # Plot 1: Policy Loss over time
+    if metrics['policy_loss']:
+        axes[0].plot(metrics['timesteps'], metrics['policy_loss'], 'r-', linewidth=2, label='Policy Loss')
+    
+    axes[0].set_xlabel('Training Steps')
+    axes[0].set_ylabel('Policy Loss')
+    axes[0].set_title('Policy Gradient Loss')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot 2: Value Loss over time
+    if metrics['value_loss']:
+        axes[1].plot(metrics['timesteps'], metrics['value_loss'], 'g-', linewidth=2, label='Value Loss')
+    
+    axes[1].set_xlabel('Training Steps')
+    axes[1].set_ylabel('Value Loss')
+    axes[1].set_title('Value Function Loss')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'ppo_{agent_name.lower().replace(" ", "_")}_training_metrics.png', dpi=300, bbox_inches='tight')
+    print(f"✅ {agent_name} training metrics plot saved: ppo_{agent_name.lower().replace(' ', '_')}_training_metrics.png")
+    plt.show()
+    
+    # Calculate and return improvement percentages
+    initial_policy_loss = metrics['policy_loss'][0] if metrics['policy_loss'] else None
+    final_policy_loss = metrics['policy_loss'][-1] if metrics['policy_loss'] else None
+    initial_value_loss = metrics['value_loss'][0] if metrics['value_loss'] else None
+    final_value_loss = metrics['value_loss'][-1] if metrics['value_loss'] else None
+    
+    policy_improvement = ((initial_policy_loss - final_policy_loss) / initial_policy_loss * 100) if initial_policy_loss and final_policy_loss and initial_policy_loss > 0 else None
+    value_improvement = ((initial_value_loss - final_value_loss) / initial_value_loss * 100) if initial_value_loss and final_value_loss and initial_value_loss > 0 else None
+    
+    return policy_improvement, value_improvement
+
+def main():
+ 
+    print("=" * 80)
+    print("DYNAMIC vs STATIC RL COMPARISON FOR POISSON FJSP")
+    print("=" * 80)
+    print(f"Problem: {len(ENHANCED_JOBS_DATA)} jobs, {len(MACHINE_LIST)} machines")
+    print("Research Question: Does Dynamic RL outperform Static RL on Poisson arrivals?")
+    print(f"🔧 REPRODUCIBILITY: Fixed seed {GLOBAL_SEED} for all random components (CHANGED from 42)")
+    print("🧹 CACHE CLEARING: All MILP cache files will be removed for fresh computation")
+    print("📊 DEBUGGING: Action entropy & training metrics tracking enabled")
+    print("🚨 STRICT VALIDATION: Will halt execution if any RL outperforms MILP optimal")
+    print("=" * 80)
+    arrival_rate = 0.5  # HIGHER arrival rate to create more dynamic scenarios
+    # With λ=0.5, expected inter-arrival = 2 time units (faster than most job operations)
+    
+    # Step 1: Training Setup
+    print("\n1. TRAINING SETUP")
+    print("-" * 50)
+    perfect_timesteps = 100000    # Perfect knowledge needs less training
+    dynamic_timesteps = 100000   # Increased for better learning with integer timing
+    static_timesteps = 100000    # Increased for better learning
+    learning_rate = 7e-4       # Standard learning rate for PPO
+    
+    print(f"Perfect RL: {perfect_timesteps:,} | Dynamic RL: {dynamic_timesteps:,} | Static RL: {static_timesteps:,} timesteps")
+    print(f"Arrival rate: {arrival_rate} (expected inter-arrival: {1/arrival_rate:.1f} time units)")
+
+    # Step 2: Generate test scenarios (Poisson arrivals) - DIFFERENT from training scenarios
+    print("\n2. GENERATING TEST SCENARIOS")
+    print("-" * 40)
+    print("Expected: Dynamic RL (knows arrival distribution) > Static RL (assumes all jobs at t=0)")
+    print("Performance should be: Deterministic(~43) > Poisson Dynamic > Static(~50)")
+    print(f"⚠️  IMPORTANT: Test scenarios use seeds 5000-5009, training used seed {GLOBAL_SEED}")
+    print("   This tests generalizability to unseen arrival patterns!")
+    print("   🧹 FRESH RUN: All seeds changed to force new evaluations and clear any cached bugs")
+    test_scenarios = generate_test_scenarios(ENHANCED_JOBS_DATA, 
+                                           initial_jobs=[0, 1, 2], 
+                                           arrival_rate=arrival_rate, 
+                                           num_scenarios=10)
+    
+    # Print all test scenario arrival times
+    print("\nALL TEST SCENARIO ARRIVAL TIMES:")
+    print("-" * 50)
+    for i, scenario in enumerate(test_scenarios):
+        print(f"Scenario {i+1}: {scenario['arrival_times']}")
+        arrived_jobs = [j for j, t in scenario['arrival_times'].items() if t < float('inf')]
+        print(f"  Jobs arriving: {len(arrived_jobs)} ({sorted(arrived_jobs)})")
+        print()
+    
+    # Step 3: Train base agents (Dynamic and Static RL)
+    print("\n3. TRAINING PHASE")
+    print("-" * 40)
+    
+    print("Note: Perfect Knowledge RL will be trained separately for each test scenario")
+    print("This ensures each scenario has its optimal RL benchmark for comparison")
+    
+    # Train dynamic RL agent (knows arrival distribution only) - trained once
+
+    dynamic_model = train_dynamic_agent(ENHANCED_JOBS_DATA, MACHINE_LIST, 
+                                       initial_jobs=[0, 1, 2], arrival_rate=arrival_rate, 
+                                       total_timesteps=dynamic_timesteps,reward_mode="makespan_increment",learning_rate=learning_rate)
+
+    # Train static RL agent (assumes all jobs at t=0) - trained once
+    static_model = train_static_agent(ENHANCED_JOBS_DATA, MACHINE_LIST, total_timesteps=static_timesteps, 
+                                     reward_mode="makespan_increment", learning_rate=learning_rate)
+
+    # Analyze arrival time distribution during training
+    print("\n3.5. TRAINING ANALYSIS")
+    analyze_first_10_episodes()  # Show detailed first 10 episodes
+    
+    # NEW: Plot training losses for all agents
+    print("\n3.6. TRAINING LOSS ANALYSIS")
+    plot_training_losses_comparison()  # Compare all three agents
+    
+    # Plot individual agent analyses
+    for agent_name in ['Perfect Knowledge RL', 'Dynamic RL', 'Static RL']:
+        if agent_name in AGENT_TRAINING_METRICS and AGENT_TRAINING_METRICS[agent_name]['policy_loss']:
+            policy_imp, value_imp = plot_individual_agent_training(agent_name)
+            print(f"{agent_name}: Policy improvement: {policy_imp:.1f}%, Value improvement: {value_imp:.1f}%")
+    
+    # Step 4: Evaluate all methods on all test scenarios
+    print("\n4. EVALUATION PHASE - MULTIPLE SCENARIOS")
+    print("-" * 40)
+    print("Comparing three levels of arrival information across 10 test scenarios:")
+    print("1. Perfect Knowledge RL (knows exact arrival times)")
+    print("2. Dynamic RL (knows arrival distribution)")  
+    print("3. Static RL (assumes all jobs at t=0)")
+    
+    # Initialize results storage
+    all_results = {
+        'Perfect Knowledge RL': [],
+        'Dynamic RL': [],
+        'Static RL (dynamic)': [],
+        'Static RL (static)': [],
+        'Best Heuristic': [],
+        'MILP Optimal': []
+    }
+    
+    # Storage for first 3 scenarios for Gantt chart plotting
+    gantt_scenarios_data = []
+    
+    print(f"\nEvaluating on {len(test_scenarios)} test scenarios...")
+    
+    for i, scenario in enumerate(test_scenarios):
+        scenario_arrivals = scenario['arrival_times']
+        print(f"\nScenario {i+1}/10: {scenario_arrivals}")
+        # Train Perfect Knowledge RL specifically for this scenario
+        print(f"  Training Perfect Knowledge RL for scenario {i+1}...")
+        print(f"    Scenario arrival times: {scenario_arrivals}")
+        perfect_model = train_perfect_knowledge_agent(ENHANCED_JOBS_DATA, MACHINE_LIST, 
+                                                     arrival_times=scenario_arrivals, 
+                                                     total_timesteps=perfect_timesteps,
+                                                     reward_mode="makespan_increment", learning_rate=learning_rate)
+        
+        # Perfect Knowledge RL
+        perfect_makespan, perfect_schedule = evaluate_perfect_knowledge_on_scenario(
+            perfect_model, ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Perfect Knowledge RL'].append(perfect_makespan)
+        print(f"    Perfect RL trained specifically for this scenario: {perfect_makespan:.2f}")
+        
+        # Dynamic RL
+        dynamic_makespan, dynamic_schedule = evaluate_dynamic_on_dynamic(
+            dynamic_model, ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Dynamic RL'].append(dynamic_makespan)
+        
+        # Static RL (on dynamic scenario)
+        static_dynamic_makespan, static_dynamic_schedule = evaluate_static_on_dynamic(
+            static_model, ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Static RL (dynamic)'].append(static_dynamic_makespan)
+        
+        # Static RL (on static scenario) - only do once since it's always the same
+        if i == 0:
+            static_static_makespan, static_static_schedule = evaluate_static_on_static(
+                static_model, ENHANCED_JOBS_DATA, MACHINE_LIST)
+        all_results['Static RL (static)'].append(static_static_makespan)
+        
+        # Best Heuristic
+        spt_makespan, spt_schedule = spt_heuristic_poisson(ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Best Heuristic'].append(spt_makespan)
+        
+        # MILP Optimal Solution
+        milp_makespan, milp_schedule = milp_optimal_scheduler(ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['MILP Optimal'].append(milp_makespan)
+        
+        # Store ALL scenarios for Gantt plotting
+        gantt_scenarios_data.append({
+            'scenario_id': i,
+            'arrival_times': scenario_arrivals,
+            'schedules': {
+                'MILP Optimal': (milp_makespan, milp_schedule),
+                'Perfect Knowledge RL': (perfect_makespan, perfect_schedule),
+                'Dynamic RL': (dynamic_makespan, dynamic_schedule),
+                'Static RL (dynamic)': (static_dynamic_makespan, static_dynamic_schedule),
+                'Static RL (static)': (static_static_makespan, static_static_schedule),
+                'Best Heuristic': (spt_makespan, spt_schedule)
+            }
+        })
+        
+        # Verify all schedules for correctness
+        print(f"  Verifying schedule correctness for scenario {i+1}:")
+        
+        methods_to_verify = [
+            ("MILP Optimal", milp_makespan, milp_schedule),
+            ("Perfect Knowledge RL", perfect_makespan, perfect_schedule),
+            ("Dynamic RL", dynamic_makespan, dynamic_schedule),
+            ("Static RL (dynamic)", static_dynamic_makespan, static_dynamic_schedule),
+            ("Best Heuristic", spt_makespan, spt_schedule)
+        ]
+        
+        for method_name, reported_makespan, schedule in methods_to_verify:
+            if reported_makespan != float('inf') and schedule:
+                is_valid, true_makespan = verify_schedule_correctness(schedule, ENHANCED_JOBS_DATA, scenario_arrivals, method_name)
+                if is_valid:
+                    if abs(reported_makespan - true_makespan) > 0.01:
+                        print(f"    ⚠️  {method_name}: Makespan mismatch! Reported: {reported_makespan:.2f}, Actual: {true_makespan:.2f}")
+                        # Update the reported makespan to the correct one
+                        if method_name == "Perfect Knowledge RL":
+                            perfect_makespan = true_makespan
+                        elif method_name == "Dynamic RL":
+                            dynamic_makespan = true_makespan
+                        elif method_name == "Static RL (dynamic)":
+                            static_dynamic_makespan = true_makespan
+                    else:
+                        print(f"    ✅ {method_name}: Valid schedule, makespan: {true_makespan:.2f}")
+                else:
+                    print(f"    ❌ {method_name}: Invalid schedule!")
+                    # Mark as failed
+                    if method_name == "Perfect Knowledge RL":
+                        perfect_makespan = float('inf')
+                    elif method_name == "Dynamic RL":
+                        dynamic_makespan = float('inf')
+                    elif method_name == "Static RL (dynamic)":
+                        static_dynamic_makespan = float('inf')
+            else:
+                print(f"    ❌ {method_name}: No valid schedule!")
+        
+        # Check for duplicate schedules across methods (debugging identical results)
+        schedules_for_comparison = [
+            ("Perfect Knowledge RL", perfect_schedule),
+            ("Dynamic RL", dynamic_schedule),
+            ("Static RL (dynamic)", static_dynamic_schedule)
+        ]
+        
+        for i_method, (method1, sched1) in enumerate(schedules_for_comparison):
+            for j_method, (method2, sched2) in enumerate(schedules_for_comparison[i_method+1:], i_method+1):
+                if sched1 and sched2 and schedules_identical(sched1, sched2):
+                    print(f"    🚨 WARNING: {method1} and {method2} produced identical schedules!")
+        
+        print()  # Empty line for readability
+        
+        # Store first 3 scenarios for Gantt plotting
+        if i < 3:
+            gantt_scenarios_data.append({
+                'scenario_id': i,
+                'arrival_times': scenario_arrivals,
+                'schedules': {
+                    'MILP Optimal': (milp_makespan, milp_schedule),
+                    'Perfect Knowledge RL': (perfect_makespan, perfect_schedule),
+                    'Dynamic RL': (dynamic_makespan, dynamic_schedule),
+                    'Static RL (dynamic)': (static_dynamic_makespan, static_dynamic_schedule),
+                    'Static RL (static)': (static_static_makespan, static_static_schedule),
+                    'Best Heuristic': (spt_makespan, spt_schedule)
+                }
+            })
+        
+        print(f"  Results: Perfect={perfect_makespan:.2f}, Dynamic={dynamic_makespan:.2f}, Static(dyn)={static_dynamic_makespan:.2f}, Heuristic={spt_makespan:.2f}, MILP={milp_makespan:.2f}")
+        
+        # STRICT DEBUG: Check for impossible results and HALT execution if found
+        if milp_makespan != float('inf') and dynamic_makespan < milp_makespan - 0.001:  # Small tolerance for numerical precision
+            print(f"  🚨🚨🚨 FATAL ERROR: Dynamic RL ({dynamic_makespan:.2f}) outperformed MILP Optimal ({milp_makespan:.2f})!")
+            print(f"      This is THEORETICALLY IMPOSSIBLE - Dynamic RL cannot be better than MILP optimal!")
+            print(f"      Bug in: evaluation function, schedule validation, or MILP formulation")
+            print(f"      HALTING EXECUTION to investigate...")
+            exit(1)
+        
+        if milp_makespan != float('inf') and perfect_makespan < milp_makespan - 0.001:  # Small tolerance for numerical precision
+            print(f"  🚨🚨🚨 FATAL ERROR: Perfect Knowledge RL ({perfect_makespan:.2f}) outperformed MILP Optimal ({milp_makespan:.2f})!")
+            print(f"      This is THEORETICALLY IMPOSSIBLE - RL cannot be better than MILP optimal!")
+            print(f"      Bug in: evaluation function, schedule validation, or MILP formulation")
+            print(f"      HALTING EXECUTION to investigate...")
+            exit(1)
+        
+        if perfect_makespan > dynamic_makespan + 5.0:  # Increased tolerance for training variations
+            print(f"  🚨 WARNING: Perfect Knowledge RL ({perfect_makespan:.2f}) much worse than Dynamic RL ({dynamic_makespan:.2f})")
+            print(f"      Perfect RL should generally be better since it knows exact arrival times")
+            print(f"      This may indicate training issues or very difficult scenario")
+        
+        # Check if Dynamic RL is giving same result as previous scenarios
+        if i > 0 and abs(dynamic_makespan - all_results['Dynamic RL'][i-1]) < 0.01:
+            print(f"  🚨 SUSPICIOUS: Dynamic RL giving identical makespan to previous scenario")
+            print(f"      This suggests evaluation isn't properly using different arrival times")
+    
+    # Calculate average results
+    avg_results = {}
+    std_results = {}
+    for method, results in all_results.items():
+        valid_results = [r for r in results if r != float('inf')]
+        if valid_results:
+            avg_results[method] = np.mean(valid_results)
+            std_results[method] = np.std(valid_results)
+        else:
+            avg_results[method] = float('inf')
+            std_results[method] = 0
+    
+    # Use first scenario data for single-scenario analyses (backward compatibility)
+    first_scenario_arrivals = test_scenarios[0]['arrival_times']
+    static_arrivals = {job_id: 0.0 for job_id in ENHANCED_JOBS_DATA.keys()}
+    
+    # Get individual results from first scenario for single plots
+    perfect_makespan = all_results['Perfect Knowledge RL'][0]
+    dynamic_makespan = all_results['Dynamic RL'][0]  
+    static_dynamic_makespan = all_results['Static RL (dynamic)'][0]
+    static_static_makespan = all_results['Static RL (static)'][0]
+    spt_makespan = all_results['Best Heuristic'][0]
+    milp_makespan = all_results['MILP Optimal'][0]
+    
+    # Get schedules from first scenario
+    perfect_schedule = gantt_scenarios_data[0]['schedules']['Perfect Knowledge RL'][1]
+    dynamic_schedule = gantt_scenarios_data[0]['schedules']['Dynamic RL'][1]
+    static_dynamic_schedule = gantt_scenarios_data[0]['schedules']['Static RL (dynamic)'][1]
+    static_static_schedule = gantt_scenarios_data[0]['schedules']['Static RL (static)'][1]
+    spt_schedule = gantt_scenarios_data[0]['schedules']['Best Heuristic'][1]
+    milp_schedule = gantt_scenarios_data[0]['schedules']['MILP Optimal'][1]
+    
+    # Step 5: Results Analysis
+    print("\n5. RESULTS ANALYSIS")
+    print("=" * 60)
+    print("AVERAGE RESULTS ACROSS 10 TEST SCENARIOS:")
+    print(f"MILP Optimal              - Avg Makespan: {avg_results['MILP Optimal']:.2f} ± {std_results['MILP Optimal']:.2f}")
+    print(f"Perfect Knowledge RL      - Avg Makespan: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f}")
+    print(f"Dynamic RL (Poisson)      - Avg Makespan: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f}")  
+    print(f"Static RL (on dynamic)    - Avg Makespan: {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f}")
+    print(f"Static RL (on static)     - Avg Makespan: {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f}")
+    print(f"Best Heuristic            - Avg Makespan: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f}")
+    
+    print("\nFirst Scenario Results (for detailed analysis):")
+    print(f"MILP Optimal              - Makespan: {milp_makespan:.2f} (THEORETICAL BEST)")
+    print(f"Perfect Knowledge RL      - Makespan: {perfect_makespan:.2f}")
+    print(f"Dynamic RL (Poisson)      - Makespan: {dynamic_makespan:.2f}")  
+    print(f"Static RL (on dynamic)    - Makespan: {static_dynamic_makespan:.2f}")
+    print(f"Static RL (on static)     - Makespan: {static_static_makespan:.2f}")
+    print(f"Best Heuristic            - Makespan: {spt_makespan:.2f}")
+    
+    print("\nAverage Performance Ranking:")
+    avg_results_list = [
+        ("MILP Optimal", avg_results['MILP Optimal']),
+        ("Perfect Knowledge RL", avg_results['Perfect Knowledge RL']),
+        ("Dynamic RL", avg_results['Dynamic RL']), 
+        ("Static RL (dynamic)", avg_results['Static RL (dynamic)']),
+        ("Static RL (static)", avg_results['Static RL (static)']),
+        ("Best Heuristic", avg_results['Best Heuristic'])
+    ]
+    avg_results_list.sort(key=lambda x: x[1])
+    for i, (method, makespan) in enumerate(avg_results_list, 1):
+        if makespan == float('inf'):
+            print(f"{i}. {method}: Failed")
+        else:
+            print(f"{i}. {method}: {makespan:.2f}")
+    
+    print(f"\nExpected Performance Hierarchy:")
+    print(f"MILP Optimal ≤ Perfect Knowledge ≤ Dynamic RL ≤ Static RL")
+    if avg_results['MILP Optimal'] != float('inf'):
+        print(f"Actual Avg: {avg_results['MILP Optimal']:.2f} ≤ {avg_results['Perfect Knowledge RL']:.2f} ≤ {avg_results['Dynamic RL']:.2f} ≤ {avg_results['Static RL (dynamic)']:.2f}")
+    else:
+        print(f"Actual Avg (no MILP): {avg_results['Perfect Knowledge RL']:.2f} ≤ {avg_results['Dynamic RL']:.2f} ≤ {avg_results['Static RL (dynamic)']:.2f}")
+    
+    # Step 5.5: Average Regret Analysis (Gap from Optimal across all scenarios)
+    if avg_results['MILP Optimal'] != float('inf'):
+        avg_methods_results = {
+            "Perfect Knowledge RL": avg_results['Perfect Knowledge RL'],
+            "Dynamic RL": avg_results['Dynamic RL'],
+            "Static RL (dynamic)": avg_results['Static RL (dynamic)'],
+            "Static RL (static)": avg_results['Static RL (static)'],
+            "Best Heuristic": avg_results['Best Heuristic']
+        }
+        print("\nAVERAGE REGRET ANALYSIS:")
+        regret_results = calculate_regret_analysis(avg_results['MILP Optimal'], avg_methods_results)
+        
+        # Also calculate regret for each individual scenario
+        print("\nINDIVIDUAL SCENARIO REGRET ANALYSIS:")
+        all_regrets = {method: [] for method in avg_methods_results.keys()}
+        
+        for i in range(len(test_scenarios)):
+            if all_results['MILP Optimal'][i] != float('inf'):
+                scenario_methods = {
+                    "Perfect Knowledge RL": all_results['Perfect Knowledge RL'][i],
+                    "Dynamic RL": all_results['Dynamic RL'][i],
+                    "Static RL (dynamic)": all_results['Static RL (dynamic)'][i],
+                    "Static RL (static)": all_results['Static RL (static)'][i],
+                    "Best Heuristic": all_results['Best Heuristic'][i]
+                }
+                
+                optimal = all_results['MILP Optimal'][i]
+                for method, makespan in scenario_methods.items():
+                    if makespan != float('inf'):
+                        regret = ((makespan - optimal) / optimal) * 100
+                        all_regrets[method].append(regret)
+        
+        print("Regret Statistics (% above optimal):")
+        for method, regret_list in all_regrets.items():
+            if regret_list:
+                avg_regret = np.mean(regret_list)
+                std_regret = np.std(regret_list)
+                min_regret = np.min(regret_list)
+                max_regret = np.max(regret_list)
+                print(f"{method:25s}: {avg_regret:6.1f}% ± {std_regret:5.1f}% (range: {min_regret:.1f}% - {max_regret:.1f}%)")
+            else:
+                print(f"{method:25s}: No valid results")
+    
+    # Validate expected ordering
+    if perfect_makespan <= dynamic_makespan <= static_dynamic_makespan:
+        print("✅ EXPECTED: Perfect knowledge outperforms distribution knowledge outperforms no knowledge")
+    else:
+        print("❌ UNEXPECTED: Performance doesn't follow expected hierarchy")
+    
+    # Diagnose performance similarity issues
+    diagnose_performance_similarity(perfect_makespan, dynamic_makespan, static_dynamic_makespan, spt_makespan)
+    
+    # Performance comparisons
+    print("\n6. PERFORMANCE COMPARISON")
+    print("-" * 40)
+    
+    # Perfect Knowledge vs Dynamic RL
+    if perfect_makespan < dynamic_makespan:
+        perfect_advantage = ((dynamic_makespan - perfect_makespan) / dynamic_makespan) * 100
+        print(f"Perfect Knowledge advantage over Dynamic RL: {perfect_advantage:.1f}%")
+    
+    # Dynamic RL vs Static RL (on dynamic scenario)
+    if dynamic_makespan < static_dynamic_makespan:
+        improvement = ((static_dynamic_makespan - dynamic_makespan) / static_dynamic_makespan) * 100
+        print(f"✓ Dynamic RL outperforms Static RL (dynamic) by {improvement:.1f}%")
+    else:
+        gap = ((dynamic_makespan - static_dynamic_makespan) / static_dynamic_makespan) * 100
+        print(f"✗ Dynamic RL underperforms Static RL (dynamic) by {gap:.1f}%")
+    
+    # Static RL comparison: dynamic vs static scenarios
+    if static_static_makespan < static_dynamic_makespan:
+        improvement = ((static_dynamic_makespan - static_static_makespan) / static_dynamic_makespan) * 100
+        print(f"✓ Static RL performs {improvement:.1f}% better on static scenarios (as expected)")
+    else:
+        gap = ((static_static_makespan - static_dynamic_makespan) / static_static_makespan) * 100
+        print(f"⚠️ Unexpected: Static RL performs {gap:.1f}% worse on static scenarios")
+    
+    # Dynamic RL vs Best Heuristic
+    if dynamic_makespan < spt_makespan:
+        improvement = ((spt_makespan - dynamic_makespan) / spt_makespan) * 100
+        print(f"✓ Dynamic RL outperforms Best Heuristic by {improvement:.1f}%")
+    else:
+        gap = ((dynamic_makespan - spt_makespan) / spt_makespan) * 100
+        print(f"✗ Dynamic RL underperforms Best Heuristic by {gap:.1f}%")
+    
+    # Step 7: Generate Gantt Charts for Comparison
+    print(f"\n7. GANTT CHART COMPARISON")
+    print("-" * 60)
+    
+    # Main comparison with 4 plots (remove static RL on static from main plot)
+    num_plots = 5 if milp_makespan != float('inf') else 4
+    fig, axes = plt.subplots(num_plots, 1, figsize=(18, num_plots * 3.5))
+    
+    if milp_makespan != float('inf'):
+        fig.suptitle('Main Scheduling Comparison: MILP vs Perfect Knowledge vs Dynamic vs Static RL vs Best Heuristic\n' + 
+                     f'Test Scenario: Jobs 0-2 at t=0, Jobs 3-6 via Poisson arrivals\n' +
+                     f'Static RL evaluated on dynamic scenario with arrivals', 
+                     fontsize=16, fontweight='bold')
+        schedules_data = [
+            {'schedule': milp_schedule, 'makespan': milp_makespan, 'title': 'MILP Optimal (Benchmark)', 'arrival_times': first_scenario_arrivals},
+            {'schedule': perfect_schedule, 'makespan': perfect_makespan, 'title': 'Perfect Knowledge RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': dynamic_schedule, 'makespan': dynamic_makespan, 'title': 'Dynamic RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': static_dynamic_schedule, 'makespan': static_dynamic_makespan, 'title': 'Static RL (on dynamic scenario)', 'arrival_times': first_scenario_arrivals},
+            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'Best Heuristic', 'arrival_times': first_scenario_arrivals}
+        ]
+    else:
+        fig.suptitle('Main Scheduling Comparison: Perfect Knowledge vs Dynamic vs Static RL vs Best Heuristic\n' + 
+                     f'Test Scenario: Jobs 0-2 at t=0, Jobs 3-6 via Poisson arrivals\n' +
+                     f'Static RL evaluated on dynamic scenario with arrivals', 
+                     fontsize=16, fontweight='bold')
+        schedules_data = [
+            {'schedule': perfect_schedule, 'makespan': perfect_makespan, 'title': 'Perfect Knowledge RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': dynamic_schedule, 'makespan': dynamic_makespan, 'title': 'Dynamic RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': static_dynamic_schedule, 'makespan': static_dynamic_makespan, 'title': 'Static RL (on dynamic scenario)', 'arrival_times': first_scenario_arrivals},
+            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'Best Heuristic', 'arrival_times': first_scenario_arrivals}
+        ]
+    
+    colors = plt.cm.tab20.colors
+    
+    # Calculate the maximum makespan across all schedules for consistent scaling
+    max_makespan_for_scaling = 0
+    for data in schedules_data:
+        schedule = data['schedule']
+        if schedule and any(len(ops) > 0 for ops in schedule.values()):
+            schedule_max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+            max_makespan_for_scaling = max(max_makespan_for_scaling, schedule_max_time)
+    
+    # Add some padding (10%) for visual clarity
+    consistent_x_limit = max_makespan_for_scaling * 1.1 if max_makespan_for_scaling > 0 else 100
+    
+    for plot_idx, data in enumerate(schedules_data):
+        schedule = data['schedule']
+        makespan = data['makespan']
+        title = data['title']
+        arrival_times = data['arrival_times']
+        
+        ax = axes[plot_idx]
+        
+        if not schedule or all(len(ops) == 0 for ops in schedule.values()):
+            ax.text(0.5, 0.5, 'No valid schedule', ha='center', va='center', 
+                   transform=ax.transAxes, fontsize=14)
+            ax.set_title(f"{title} - No Solution")
+            # Still apply consistent scaling even for failed schedules
+            ax.set_xlim(0, consistent_x_limit)
+            ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)
+            continue
+        
+        # Plot operations for each machine
+        for idx, machine in enumerate(MACHINE_LIST):
+            machine_ops = schedule.get(machine, [])
+            machine_ops.sort(key=lambda x: x[1])  # Sort by start time
+            
+            for op_data in machine_ops:
+                if len(op_data) >= 3:
+                    job_op, start_time, end_time = op_data[:3]
+                    duration = end_time - start_time
+                    
+                    # Extract job number for coloring
+                    job_num = 0
+                    if 'J' in job_op:
+                        try:
+                            job_num = int(job_op.split('J')[1].split('-')[0])
+                        except:
+                            job_num = 0
+                    
+                    color = colors[job_num % len(colors)]
+                    
+                    ax.barh(idx, duration, left=start_time, height=0.6, 
+                           color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+                    
+                    # Add operation label
+                    if duration > 1:  # Only add text if bar is wide enough
+                        ax.text(start_time + duration/2, idx, job_op, 
+                               ha='center', va='center', fontsize=8, fontweight='bold')
+
+        # Add red arrows for job arrivals (only for dynamic jobs that arrive > 0)
+        if arrival_times:
+            arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
+            for job_id, arrival_time in arrival_times.items():
+                if arrival_time > 0 and arrival_time < consistent_x_limit:  # Only show arrows for jobs that don't start at t=0 and arrive within time horizon
+                    # Draw vertical line for arrival
+                    ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=2)
+                    
+                    # Add arrow and label
+                    ax.annotate(f'Job {job_id} arrives', 
+                               xy=(arrival_time, arrow_y_position), 
+                               xytext=(arrival_time, arrow_y_position + 0.5),
+                               arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                               ha='center', va='bottom', color='red', fontweight='bold', fontsize=9,
+                               bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='red', alpha=0.8))
+        
+        # Formatting
+        ax.set_yticks(range(len(MACHINE_LIST)))
+        ax.set_yticklabels(MACHINE_LIST)
+        ax.set_xlabel("Time" if plot_idx == len(schedules_data)-1 else "")
+        ax.set_ylabel("Machines")
+        ax.set_title(f"{title} (Makespan: {makespan:.2f})", fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        
+        # Apply consistent x-axis limits across all subplots
+        ax.set_xlim(0, consistent_x_limit)
+        ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)  # Extra space for arrival arrows and labels
+    
+    # Add legend
+    legend_elements = []
+    for i in range(len(ENHANCED_JOBS_DATA)):
+        color = colors[i % len(colors)]
+        initial_or_poisson = ' (Initial)' if i < 3 else ' (Poisson)'
+        legend_elements.append(plt.Rectangle((0, 0), 1, 1, facecolor=color, 
+                                          alpha=0.8, label=f'Job {i}{initial_or_poisson}'))
+    
+    fig.legend(handles=legend_elements, loc='center', bbox_to_anchor=(0.5, 0.02), 
+              ncol=len(ENHANCED_JOBS_DATA), fontsize=10)
+    
+    plt.tight_layout(rect=[0, 0.08, 1, 0.95])
+    
+    # Save with appropriate filename based on MILP availability
+    if milp_makespan != float('inf'):
+        filename = 'complete_scheduling_comparison_with_milp_optimal.png'
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved comprehensive comparison with MILP optimal: {filename}")
+    else:
+        filename = 'dynamic_vs_static_gantt_comparison-7jobs.png'
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved comparison without MILP: {filename}")
+    
+    plt.show()
+    
+    # Skip the separate static RL comparison - focus on 10 test scenarios
+    # Step 8: Create Gantt Charts for All 10 Test Scenarios (5 methods only)
+    print(f"\n8. GANTT CHARTS FOR ALL 10 TEST SCENARIOS")
+    print("-" * 60)
+    
+    # Create small_instances folder
+    import os
+    folder_name = "small_instances_0.5rate"
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
+        print(f"Created folder: {folder_name}")
+    
+    # Generate Gantt charts for all 10 scenarios using stored data only
+    for scenario_idx in range(len(gantt_scenarios_data)):
+        scenario = gantt_scenarios_data[scenario_idx]
+        scenario_id = scenario['scenario_id']
+        arrival_times = scenario['arrival_times']
+        schedules = scenario['schedules']
+        print(f"\nGenerating Gantt chart for Test Scenario {scenario_id + 1}...")
+        print(f"Arrival times: {arrival_times}")
+        num_methods = 5 if schedules['MILP Optimal'][0] != float('inf') else 4
+        fig, axes = plt.subplots(num_methods, 1, figsize=(16, num_methods * 3))
+        if schedules['MILP Optimal'][0] != float('inf'):
+            fig.suptitle(f'Test Scenario {scenario_id + 1} - 5 Method Comparison\n' + 
+                         f'Arrival Times: {arrival_times}', 
+                         fontsize=14, fontweight='bold')
+            methods_to_plot = [
+                ('MILP Optimal', schedules['MILP Optimal']),
+                ('Perfect Knowledge RL', schedules['Perfect Knowledge RL']),
+                ('Dynamic RL', schedules['Dynamic RL']),
+                ('Static RL (dynamic)', schedules['Static RL (dynamic)']),
+                ('Best Heuristic', schedules['Best Heuristic'])
+            ]
+        else:
+            fig.suptitle(f'Test Scenario {scenario_id + 1} - 4 Method Comparison\n' + 
+                         f'Arrival Times: {arrival_times}', 
+                         fontsize=14, fontweight='bold')
+            methods_to_plot = [
+                ('Perfect Knowledge RL', schedules['Perfect Knowledge RL']),
+                ('Dynamic RL', schedules['Dynamic RL']),
+                ('Static RL (dynamic)', schedules['Static RL (dynamic)']),
+                ('Best Heuristic', schedules['Best Heuristic'])
+            ]
+        
+        # Calculate consistent x-axis limits for this scenario
+        max_time_scenario = 0
+        for method_name, (makespan, schedule) in methods_to_plot:
+            if schedule and any(len(ops) > 0 for ops in schedule.values()):
+                scenario_max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+                max_time_scenario = max(max_time_scenario, scenario_max_time)
+        
+        x_limit_scenario = max_time_scenario * 1.1 if max_time_scenario > 0 else 100
+        
+        # Plot each method
+        colors = plt.cm.tab20.colors
+        
+        for plot_idx, (method_name, (makespan, schedule)) in enumerate(methods_to_plot):
+            ax = axes[plot_idx] if num_methods > 1 else axes
+            
+            if not schedule or all(len(ops) == 0 for ops in schedule.values()):
+                ax.text(0.5, 0.5, 'No valid schedule', ha='center', va='center', 
+                       transform=ax.transAxes, fontsize=12)
+                ax.set_title(f"{method_name} - No Solution")
+                ax.set_xlim(0, x_limit_scenario)
+                ax.set_ylim(-0.5, len(MACHINE_LIST) + 1.5)
+                continue
+            
+            # Plot operations for each machine
+            for idx, machine in enumerate(MACHINE_LIST):
+                machine_ops = schedule.get(machine, [])
+                machine_ops.sort(key=lambda x: x[1])  # Sort by start time
+                
+                for op_data in machine_ops:
+                    if len(op_data) >= 3:
+                        job_op, start_time, end_time = op_data[:3]
+                        duration = end_time - start_time
+                        
+                        # Extract job number for coloring
+                        job_num = 0
+                        if 'J' in job_op:
+                            try:
+                                job_num = int(job_op.split('J')[1].split('-')[0])
+                            except (ValueError, IndexError):
+                                job_num = 0
+                        
+                        color = colors[job_num % len(colors)]
+                        
+                        ax.barh(idx, duration, left=start_time, height=0.6, 
+                               color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+                        
+                        # Add operation label
+                        if duration > 1:  # Only add text if bar is wide enough
+                            ax.text(start_time + duration/2, idx, job_op, 
+                                   ha='center', va='center', fontsize=8, fontweight='bold')
+        
+            # Add arrival arrows for jobs that arrive after t=0
+            arrow_y_position = len(MACHINE_LIST) + 0.2
+            for job_id, arrival_time in arrival_times.items():
+                if arrival_time > 0 and arrival_time < x_limit_scenario:
+                    ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=1.5)
+                    ax.annotate(f'J{job_id}', 
+                               xy=(arrival_time, arrow_y_position), 
+                               xytext=(arrival_time, arrow_y_position + 0.3),
+                               arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
+                               ha='center', va='bottom', color='red', fontweight='bold', fontsize=8,
+                               bbox=dict(boxstyle="round,pad=0.2", facecolor='white', edgecolor='red', alpha=0.8))
+            
+            # Formatting
+            ax.set_yticks(range(len(MACHINE_LIST)))
+            ax.set_yticklabels(MACHINE_LIST)
+            ax.set_xlabel("Time" if plot_idx == len(methods_to_plot)-1 else "")
+            ax.set_ylabel("Machines")
+            ax.set_title(f"{method_name} (Makespan: {makespan:.2f})", fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, x_limit_scenario)
+            ax.set_ylim(-0.5, len(MACHINE_LIST) + 1.5)
+        
+        # Add legend for jobs
+        legend_elements = []
+        for i in range(len(ENHANCED_JOBS_DATA)):
+            color = colors[i % len(colors)]
+            initial_or_dynamic = ' (Initial)' if i < 3 else ' (Dynamic)'
+            legend_elements.append(plt.Rectangle((0, 0), 1, 1, facecolor=color, 
+                                              alpha=0.8, label=f'Job {i}{initial_or_dynamic}'))
+        
+        fig.legend(handles=legend_elements, loc='center', bbox_to_anchor=(0.5, 0.02), 
+                  ncol=len(ENHANCED_JOBS_DATA), fontsize=9)
+        
+        plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+        
+        # Save scenario-specific Gantt chart in small_instances folder
+        scenario_filename = os.path.join(folder_name, f'test_scenario_{scenario_id + 1}_gantt_comparison.png')
+        plt.savefig(scenario_filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved Test Scenario {scenario_id + 1} Gantt chart: {scenario_filename}")
+        
+        plt.close()  # Close figure to save memory
+    
+    print(f"\n✅ All 10 Gantt charts saved in {folder_name}/ folder")
+    
+    # Skip the old static RL comparison code - focus on the 10 test scenario Gantt charts above
+    
+    print("\n" + "=" * 80)
+    print("ANALYSIS COMPLETED!")
+    print("Generated files:")
+    if milp_makespan != float('inf'):
+        print("- complete_scheduling_comparison_with_milp_optimal.png: Five-method comprehensive comparison with MILP benchmark")
+        print(f"- small_instances/ folder: Contains 10 Gantt charts for all test scenarios (5 methods each)")
+        for i in range(10):
+            print(f"  ├── test_scenario_{i+1}_gantt_comparison.png")
+        print(f"\nKey Findings (Average across 10 test scenarios):")
+        print(f"• MILP Optimal (Benchmark): {avg_results['MILP Optimal']:.2f} ± {std_results['MILP Optimal']:.2f}")
+        print(f"• Perfect Knowledge RL: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f} (avg regret: +{((avg_results['Perfect Knowledge RL']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Dynamic RL: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f} (avg regret: +{((avg_results['Dynamic RL']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Static RL (on dynamic): {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f} (avg regret: +{((avg_results['Static RL (dynamic)']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Static RL (on static): {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f} (avg regret: +{((avg_results['Static RL (static)']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Best Heuristic: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f} (avg regret: +{((avg_results['Best Heuristic']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Perfect Knowledge RL validation: {'✅ Working well' if avg_results['Perfect Knowledge RL'] <= avg_results['MILP Optimal'] * 1.15 else '❌ Needs improvement'}")
+    else:
+        print("- dynamic_vs_static_gantt_comparison-7jobs.png: Five-method comparison")
+        print("- static_rl_dynamic_vs_static_comparison.png: Separate Static RL comparison (dynamic vs static scenarios)")  
+        print("- test_scenario_1_gantt_comparison.png: Detailed Gantt chart for Test Scenario 1")
+        print("- test_scenario_2_gantt_comparison.png: Detailed Gantt chart for Test Scenario 2")
+        print("- test_scenario_3_gantt_comparison.png: Detailed Gantt chart for Test Scenario 3")
+        print(f"\nKey Findings (Average across 10 test scenarios, no MILP benchmark available):")
+        print(f"• Perfect Knowledge RL: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f}")
+        print(f"• Dynamic RL: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f}")
+        print(f"• Static RL (on dynamic): {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f}")
+        print(f"• Static RL (on static): {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f}")
+        print(f"• Best Heuristic: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f}")
+        print(f"• Performance hierarchy: {'✅ Expected' if avg_results['Perfect Knowledge RL'] <= avg_results['Dynamic RL'] <= avg_results['Static RL (dynamic)'] else '❌ Unexpected'}")
+        print(f"• Static RL scenario comparison: {'✅ Better on static' if avg_results['Static RL (static)'] < avg_results['Static RL (dynamic)'] else '❌ Needs investigation'}")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
+            continue
+        
+        # Select operation based on dispatching rule
+        if rule == "FIFO":
+            selected_op = min(ready_operations, key=lambda x: (x['arrival_time'], x['job_id'], x['op_idx']))
+        elif rule == "LIFO":
+            selected_op = max(ready_operations, key=lambda x: (x['arrival_time'], x['job_id'], x['op_idx']))
+        elif rule == "SPT":
+            selected_op = min(ready_operations, key=lambda x: (x['proc_time'], x['arrival_time'], x['job_id']))
+        elif rule == "LPT":
+            selected_op = max(ready_operations, key=lambda x: (x['proc_time'], -x['arrival_time'], -x['job_id']))
+        elif rule == "EDD":
+            def due_date(op):
+                total_work = sum(min(jobs_data[op['job_id']][i]['proc_times'].values()) 
+                               for i in range(len(jobs_data[op['job_id']])))
+                return op['arrival_time'] + total_work * 1.5
+            selected_op = min(ready_operations, key=lambda x: (due_date(x), x['arrival_time'], x['job_id']))
+        else:
+            selected_op = ready_operations[0]  # Default to first
+        
+        # Schedule the selected operation
+        job_id = selected_op['job_id']
+        op_idx = selected_op['op_idx']
+        machine = selected_op['machine']
+        proc_time = selected_op['proc_time']
+        
+        # Calculate start time
+        machine_avail = machine_next_free[machine]
+        job_ready = selected_op['job_ready_time']
+        start_time = max(sim_time, machine_avail, job_ready)
+        end_time = start_time + proc_time
+        
+        # Update state
+        machine_next_free[machine] = end_time
+        job_op_end_times[job_id][op_idx] = end_time
+        job_next_op[job_id] += 1
+        schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+        
+        completed_operations += 1
+        sim_time = start_time  # Move simulation time forward
+    
+    makespan = max(machine_next_free.values()) if machine_next_free else 0
+    return makespan, schedule
+
+
+def run_heuristic_comparison(jobs_data, machine_list, arrival_times):
+    """
+    Compare different dispatching rules and return the best one.
+    Tests FIFO, LIFO, SPT, LPT, and EDD heuristics.
+    """
+    heuristics = {
+        'FIFO': lambda ops: fifo_heuristic(jobs_data, machine_list, arrival_times),
+        'LIFO': lambda ops: lifo_heuristic(jobs_data, machine_list, arrival_times), 
+        'SPT': lambda ops: spt_heuristic_simple(jobs_data, machine_list, arrival_times),
+        'LPT': lambda ops: lpt_heuristic(jobs_data, machine_list, arrival_times),
+        'EDD': lambda ops: edd_heuristic(jobs_data, machine_list, arrival_times)
+    }
+    
+    results = {}
+    for name, heuristic_func in heuristics.items():
+        try:
+            makespan, schedule = heuristic_func(None)
+            results[name] = (makespan, schedule)
+            print(f"    {name} completed with makespan: {makespan:.2f}")
+        except Exception as e:
+            print(f"    {name} failed: {e}")
+            results[name] = (float('inf'), {})
+    
+    # Find best heuristic
+    valid_results = {k: v for k, v in results.items() if v[0] != float('inf')}
+    if not valid_results:
+        print("    All heuristics failed! Using fallback.")
+        return 999.0, {m: [] for m in machine_list}
+    
+    best_name = min(valid_results.keys(), key=lambda x: valid_results[x][0])
+    best_makespan, best_schedule = valid_results[best_name]
+    
+    print(f"  Heuristic comparison results:")
+    for name, (makespan, _) in results.items():
+        if makespan == float('inf'):
+            print(f"    {name}: FAILED")
+        else:
+            status = "✅ BEST" if name == best_name else ""
+            print(f"    {name}: {makespan:.2f} {status}")
+    
+    print(f"  Selected: {best_name} Heuristic (makespan: {best_makespan:.2f})")
+    return best_makespan, best_schedule
+
+
+def fifo_heuristic(jobs_data, machine_list, arrival_times):
+    """FIFO (First In First Out) - Process jobs in arrival order."""
+    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "FIFO")
+
+
+def lifo_heuristic(jobs_data, machine_list, arrival_times):
+    """LIFO (Last In First Out) - Process newest jobs first.""" 
+    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "LIFO")
+
+
+def spt_heuristic_simple(jobs_data, machine_list, arrival_times):
+    """SPT (Shortest Processing Time) - Process shortest operations first."""
+    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "SPT")
+
+
+def lpt_heuristic(jobs_data, machine_list, arrival_times): 
+    """LPT (Longest Processing Time) - Process longest operations first."""
+    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "LPT")
+
+
+def edd_heuristic(jobs_data, machine_list, arrival_times):
+    """EDD (Earliest Due Date) - Simple version using job completion time estimates."""
+    return simple_list_scheduling(jobs_data, machine_list, arrival_times, "EDD")
+
+
+def spt_heuristic_poisson(jobs_data, machine_list, arrival_times):
+    """
+    Run comparison of simple dispatching heuristics and return the best one.
+    Uses SPT for machine selection and compares FIFO, LIFO, SPT, LPT for job sequencing.
+    """
+    print(f"  Comparing FIFO, LIFO, SPT, LPT heuristics with arrival times: {arrival_times}")
+    return run_heuristic_comparison(jobs_data, machine_list, arrival_times)
+
+
+def validate_schedule_makespan(schedule, jobs_data, arrival_times):
+    """
+    Validate a schedule and calculate its actual makespan.
+    """
+    max_completion = 0
+    job_completion_times = {}
+    
+    for machine, operations in schedule.items():
+        for op_name, start_time, end_time in operations:
+            # Parse job and operation from op_name (e.g., "J0-O1")
+            job_id = int(op_name.split('-')[0][1:])  # Extract job ID from "J0"
+            op_idx = int(op_name.split('-')[1][1:]) - 1  # Extract op index from "O1" (0-indexed)
+            
+            # Check arrival time constraint
+            if op_idx == 0:  # First operation
+                required_arrival = arrival_times.get(job_id, 0)
+                if start_time < required_arrival - 0.001:
+                    print(f"❌ Job {job_id} operation {op_idx} starts at {start_time:.2f} before arrival at {required_arrival:.2f}")
+                    return float('inf')
+            
+            # Check precedence constraint
+            if op_idx > 0:
+                prev_completion = job_completion_times.get((job_id, op_idx - 1), 0)
+                if start_time < prev_completion - 0.001:
+                    print(f"❌ Job {job_id} operation {op_idx} starts at {start_time:.2f} before previous op completes at {prev_completion:.2f}")
+                    return float('inf')
+            
+            # Record completion time
+            job_completion_times[(job_id, op_idx)] = end_time
+            max_completion = max(max_completion, end_time)
+    
+    return max_completion
+
+def milp_optimal_scheduler(jobs_data, machine_list, arrival_times):
+    """
+    MILP approach for optimal dynamic scheduling with perfect knowledge.
+    
+    This provides the theoretical optimal solution for the perfect knowledge case,
+    serving as the benchmark for regret calculation and verification of the
+    perfect knowledge RL agent performance.
+    
+    Args:
+        jobs_data: Dictionary of job data with processing times
+        machine_list: List of available machines
+        arrival_times: Dictionary of exact arrival times for each job
+        
+    Returns:
+        tuple: (optimal_makespan, optimal_schedule) or (float('inf'), empty_schedule) if failed
+    """
+    import pickle
+    import os
+    import hashlib
+    
+    # # CACHE CLEARING: Remove all existing MILP cache files to force fresh computation
+    # cache_files = [f for f in os.listdir('.') if f.startswith('milp_cache_') and f.endswith('.pkl')]
+    # for cache_file in cache_files:
+    #     try:
+    #         os.remove(cache_file)
+    #         print(f"🧹 Cleared cache file: {cache_file}")
+    #     except:
+    #         pass
+
+    print("\n--- Running MILP Optimal Scheduler ---")
+    print(f"Jobs: {len(jobs_data)}, Machines: {len(machine_list)}")
+    print(f"Arrival times: {arrival_times}")
+    
+    try:
+        prob = LpProblem("PerfectKnowledge_FJSP_Optimal", LpMinimize)
+        
+        # Generate all operations
+        ops = [(j, oi) for j in jobs_data for oi in range(len(jobs_data[j]))]
+        BIG_M = 10000  # Large constant for disjunctive constraints (increased for safety)
+
+        # Decision variables
+        x = LpVariable.dicts("x", (ops, machine_list), cat="Binary")  # Assignment variables
+        s = LpVariable.dicts("s", ops, lowBound=0)                    # Start time variables
+        c = LpVariable.dicts("c", ops, lowBound=0)                    # Completion time variables
+        y = LpVariable.dicts("y", (ops, ops, machine_list), cat="Binary")  # Sequencing variables
+        Cmax = LpVariable("Cmax", lowBound=0)                         # Makespan variable
+
+        # Objective: minimize makespan
+        prob += Cmax
+
+        # Constraints
+        for j, oi in ops:
+            # 1. Assignment constraint: each operation must be assigned to exactly one compatible machine
+            compatible_machines = [m for m in machine_list if m in jobs_data[j][oi]['proc_times']]
+            prob += lpSum(x[j, oi][m] for m in compatible_machines) == 1
+            
+            # 2. Completion time definition
+            prob += c[j, oi] == s[j, oi] + lpSum(
+                x[j, oi][m] * jobs_data[j][oi]['proc_times'][m] 
+                for m in compatible_machines
+            )
+            
+            # 3. Precedence constraints within jobs
+            if oi > 0:
+                prob += s[j, oi] >= c[j, oi - 1]
+            else:
+                # 4. Arrival time constraint for first operation of each job
+                prob += s[j, oi] >= arrival_times.get(j, 0)
+            
+            # 5. Makespan definition
+            prob += Cmax >= c[j, oi]
+
+        # 6. Disjunctive constraints for machine capacity
+        for m in machine_list:
+            ops_on_m = [op for op in ops if m in jobs_data[op[0]][op[1]]['proc_times']]
+            for i in range(len(ops_on_m)):
+                for k in range(i + 1, len(ops_on_m)):
+                    op1, op2 = ops_on_m[i], ops_on_m[k]
+                    
+                    # Create binary variable to check if both operations are on this machine
+                    both_on_m = LpVariable(f"both_{op1}_{op2}_on_{m}", cat="Binary")
+                    prob += both_on_m <= x[op1][m]
+                    prob += both_on_m <= x[op2][m]
+                    prob += both_on_m >= x[op1][m] + x[op2][m] - 1
+                    
+                    # Either op1 before op2 or op2 before op1 (only if both assigned to machine m)
+                    prob += s[op1] >= c[op2] - BIG_M * (1 - y[op1][op2][m]) - BIG_M * (1 - both_on_m)
+                    prob += s[op2] >= c[op1] - BIG_M * y[op1][op2][m] - BIG_M * (1 - both_on_m)
+
+        # Solve with time limit
+        print("Solving MILP optimization problem...")
+        prob.solve(PULP_CBC_CMD(msg=False, timeLimit=300))  # 5-minute time limit
+        
+        # Extract solution
+        schedule = {m: [] for m in machine_list}
+        
+        if prob.status == 1 and Cmax.varValue is not None:  # Optimal solution found
+            optimal_makespan = Cmax.varValue
+            
+            # Extract schedule from solution
+            for (j, oi), m in ((op, m) for op in ops for m in machine_list):
+                if m in jobs_data[j][oi]['proc_times'] and x[j, oi][m].varValue > 0.5:
+                    start_time = s[j, oi].varValue
+                    end_time = c[j, oi].varValue
+                    schedule[m].append((f"J{j}-O{oi+1}", start_time, end_time))
+            
+            # Sort operations by start time for each machine
+            for m in machine_list:
+                schedule[m].sort(key=lambda x: x[1])
+            
+            # CRITICAL VALIDATION: Verify MILP schedule is actually valid
+            print(f"🔍 VALIDATING MILP SOLUTION...")
+            actual_makespan = validate_schedule_makespan(schedule, jobs_data, arrival_times)
+            
+            if abs(actual_makespan - optimal_makespan) > 0.001:
+                print(f"❌ MILP VALIDATION FAILED!")
+                print(f"   MILP claimed makespan: {optimal_makespan:.2f}")
+                print(f"   Actual schedule makespan: {actual_makespan:.2f}")
+                print(f"   This explains why RL appears to beat MILP - MILP solution is invalid!")
+                return float('inf'), {}  # Return invalid result
+            
+            print(f"✅ MILP OPTIMAL SOLUTION VALIDATED!")
+            print(f"   Optimal Makespan: {optimal_makespan:.2f}")
+            print(f"   This represents the THEORETICAL BEST possible performance")
+            print(f"   with perfect knowledge of arrival times: {arrival_times}")
+            
+            # DO NOT cache result - force fresh computation each time for debugging
+            print(f"   ⚠️  Caching disabled for debugging - fresh computation each run")
+            
+            return optimal_makespan, schedule
+            
+        else:
+            print(f"❌ MILP solver failed to find optimal solution (status: {prob.status})")
+            print("   Possible reasons: problem too complex, time limit exceeded, or infeasible")
+            return float('inf'), schedule
+            
+    except Exception as e:
+        print(f"❌ MILP solver error: {e}")
+        return float('inf'), {m: [] for m in machine_list}
+
+
+def diagnose_performance_similarity(perfect_makespan, dynamic_makespan, static_makespan, spt_makespan):
+    """
+    Diagnose why the different methods might have similar performance.
+    This helps identify if the problem setup is creating meaningful differences.
+    """
+    print(f"\n=== PERFORMANCE SIMILARITY DIAGNOSIS ===")
+    
+    results = [
+        ("Perfect Knowledge RL", perfect_makespan),
+        ("Dynamic RL", dynamic_makespan), 
+        ("Static RL", static_makespan),
+        ("Best Heuristic", spt_makespan)
+    ]
+    
+    makespans = [makespan for _, makespan in results]
+    
+    # Calculate performance spread
+    max_makespan = max(makespans)
+    min_makespan = min(makespans)
+    spread = max_makespan - min_makespan
+    
+    # Handle division by zero if min_makespan is 0
+    if min_makespan > 0:
+        relative_spread = spread / min_makespan * 100
+    else:
+        # Find the smallest non-zero makespan for relative comparison
+        non_zero_makespans = [m for m in makespans if m > 0]
+        if non_zero_makespans:
+            relative_spread = spread / min(non_zero_makespans) * 100
+        else:
+            relative_spread = 0.0
+    
+    print(f"Performance spread: {spread:.2f} time units ({relative_spread:.1f}%)")
+    
+    if relative_spread < 5:
+        print("🔴 ISSUE: Very small performance differences (<5%)")
+        print("   Possible causes:")
+        print("   - Arrival rate too low (jobs arrive too late to matter)")
+        print("   - Test scenario too easy (all methods find similar solutions)")
+        print("   - State representation not sufficiently informative")
+        print("   - Training not sufficient to learn anticipatory behavior")
+    elif relative_spread < 15:
+        print("🟡 MODERATE: Small but measurable differences (5-15%)")
+        print("   This suggests some advantage but limited differentiation")
+    else:
+        print("🟢 GOOD: Clear performance differences (>15%)")
+        print("   Methods are showing distinct capabilities")
+    
+    # Check if hierarchy is as expected
+    expected_order = perfect_makespan <= dynamic_makespan <= static_makespan
+    if expected_order:
+        print("✅ Expected performance hierarchy maintained")
+    else:
+        print("❌ Unexpected performance hierarchy - investigate training issues")
+    
+    # Recommendations
+    print(f"\nRecommendations:")
+    if relative_spread < 5:
+        print("- Increase arrival rate (try λ=1.0 or higher)")
+        print("- Use longer training episodes") 
+        print("- Add more complex job structures")
+        print("- Increase reward differentiation for anticipatory actions")
+
+
+def calculate_regret_analysis(optimal_makespan, methods_results):
+    """
+    Calculate regret (performance gap from optimal) for all methods.
+    
+    Regret provides a normalized measure of how far each method is from
+    the theoretical optimum, helping understand the relative performance
+    and the room for improvement.
+    
+    Args:
+        optimal_makespan: The MILP optimal makespan (benchmark)
+        methods_results: Dict with method names as keys and makespans as values
+        
+    Returns:
+        dict: Regret analysis results
+    """
+    print("\n" + "="*60)
+    print("REGRET ANALYSIS (Gap from MILP Optimal)")
+    print("="*60)
+    
+    if optimal_makespan == float('inf') or optimal_makespan <= 0:
+        print("❌ No valid optimal solution available for regret calculation")
+        return None
+    
+    print(f"📊 MILP Optimal Makespan (Benchmark): {optimal_makespan:.2f}")
+    print("-" * 60)
+    
+    regret_results = {}
+    
+    # Calculate regret for each method
+    for method_name, makespan in methods_results.items():
+        if makespan == float('inf'):
+            regret_abs = float('inf')
+            regret_rel = float('inf')
+        else:
+            regret_abs = makespan - optimal_makespan  # Absolute regret
+            regret_rel = (regret_abs / optimal_makespan) * 100  # Relative regret (%)
+        
+        regret_results[method_name] = {
+            'makespan': makespan,
+            'absolute_regret': regret_abs,
+            'relative_regret_percent': regret_rel
+        }
+        
+        # Display results with status indicators
+        if regret_abs == 0:
+            status = "🎯 OPTIMAL"
+        elif regret_rel <= 5:
+            status = "🟢 EXCELLENT"
+        elif regret_rel <= 15:
+            status = "🟡 GOOD"
+        elif regret_rel <= 30:
+            status = "🟠 ACCEPTABLE"
+        else:
+            status = "🔴 POOR"
+        
+        print(f"{method_name:25s}: {makespan:6.2f} | Regret: +{regret_abs:5.2f} (+{regret_rel:5.1f}%) {status}")
+    
+    # Analysis and insights
+    print("\n" + "-" * 60)
+    print("KEY INSIGHTS:")
+    
+    # Find best and worst performing methods
+    valid_methods = {k: v for k, v in regret_results.items() 
+                    if v['absolute_regret'] != float('inf')}
+    
+    if valid_methods:
+        best_method = min(valid_methods.items(), key=lambda x: x[1]['absolute_regret'])
+        worst_method = max(valid_methods.items(), key=lambda x: x[1]['absolute_regret'])
+        
+        print(f"🏆 Best Method: {best_method[0]} (regret: +{best_method[1]['relative_regret_percent']:.1f}%)")
+        print(f"⚠️  Worst Method: {worst_method[0]} (regret: +{worst_method[1]['relative_regret_percent']:.1f}%)")
+        
+        # Calculate performance gap between best and worst
+        performance_gap = worst_method[1]['absolute_regret'] - best_method[1]['absolute_regret']
+        print(f"📈 Performance Gap: {performance_gap:.2f} time units between best and worst")
+        
+        # Perfect Knowledge RL validation
+        if 'Perfect Knowledge RL' in valid_methods:
+            pk_regret = valid_methods['Perfect Knowledge RL']['relative_regret_percent']
+            if pk_regret <= 10:
+                print(f"✅ Perfect Knowledge RL is performing well (regret: {pk_regret:.1f}%)")
+                print("   This validates that the RL agent can effectively use arrival information")
+            else:
+                print(f"❌ Perfect Knowledge RL has high regret ({pk_regret:.1f}%)")
+                print("   Consider: longer training, better hyperparameters, or state representation issues")
+    
+    # Check if hierarchy is as expected
+    expected_order = (
+        regret_results['Perfect Knowledge RL']['absolute_regret'] <= 
+        regret_results['Dynamic RL']['absolute_regret'] <= 
+        regret_results['Static RL (dynamic)']['absolute_regret']
+    )
+    
+    if expected_order:
+        print("✅ Expected regret hierarchy maintained")
+    else:
+        print("❌ Unexpected regret hierarchy - investigate training issues")
+    
+    # Recommendations
+    print(f"\nRecommendations:")
+    if regret_results and len([v for v in regret_results.values() if v['absolute_regret'] != float('inf')]) > 1:
+        regret_values = [v['absolute_regret'] for v in regret_results.values() if v['absolute_regret'] != float('inf')]
+        regret_spread = max(regret_values) - min(regret_values)
+        avg_regret = sum(regret_values) / len(regret_values)
+        relative_regret_spread = (regret_spread / avg_regret * 100) if avg_regret > 0 else 0
+        
+        if relative_regret_spread < 5:
+            print("- Increase arrival rate (try λ=1.0 or higher)")
+            print("- Use longer training episodes") 
+            print("- Add more complex job structures")
+            print("- Increase reward differentiation for anticipatory actions")
+        else:
+            print("- Methods showing good differentiation, consider fine-tuning hyperparameters")
+    else:
+        print("- Need more valid methods for comparison analysis")
+
+
+def main():
+ 
+    print("=" * 80)
+    print("DYNAMIC vs STATIC RL COMPARISON FOR POISSON FJSP")
+    print("=" * 80)
+    print(f"Problem: {len(ENHANCED_JOBS_DATA)} jobs, {len(MACHINE_LIST)} machines")
+    print("Research Question: Does Dynamic RL outperform Static RL on Poisson arrivals?")
+    print(f"🔧 REPRODUCIBILITY: Fixed seed {GLOBAL_SEED} for all random components (CHANGED from 42)")
+    print("🧹 CACHE CLEARING: All MILP cache files will be removed for fresh computation")
+    print("📊 DEBUGGING: Action entropy & training metrics tracking enabled")
+    print("🚨 STRICT VALIDATION: Will halt execution if any RL outperforms MILP optimal")
+    print("=" * 80)
+    arrival_rate = 0.5  # HIGHER arrival rate to create more dynamic scenarios
+    # With λ=0.5, expected inter-arrival = 2 time units (faster than most job operations)
+    
+    # Step 1: Training Setup
+    print("\n1. TRAINING SETUP")
+    print("-" * 50)
+    perfect_timesteps = 100000    # Perfect knowledge needs less training
+    dynamic_timesteps = 100000   # Increased for better learning with integer timing
+    static_timesteps = 100000    # Increased for better learning
+    learning_rate = 7e-4       # Standard learning rate for PPO
+    
+    print(f"Perfect RL: {perfect_timesteps:,} | Dynamic RL: {dynamic_timesteps:,} | Static RL: {static_timesteps:,} timesteps")
+    print(f"Arrival rate: {arrival_rate} (expected inter-arrival: {1/arrival_rate:.1f} time units)")
+
+    # Step 2: Generate test scenarios (Poisson arrivals) - DIFFERENT from training scenarios
+    print("\n2. GENERATING TEST SCENARIOS")
+    print("-" * 40)
+    print("Expected: Dynamic RL (knows arrival distribution) > Static RL (assumes all jobs at t=0)")
+    print("Performance should be: Deterministic(~43) > Poisson Dynamic > Static(~50)")
+    print(f"⚠️  IMPORTANT: Test scenarios use seeds 5000-5009, training used seed {GLOBAL_SEED}")
+    print("   This tests generalizability to unseen arrival patterns!")
+    print("   🧹 FRESH RUN: All seeds changed to force new evaluations and clear any cached bugs")
+    test_scenarios = generate_test_scenarios(ENHANCED_JOBS_DATA, 
+                                           initial_jobs=[0, 1, 2], 
+                                           arrival_rate=arrival_rate, 
+                                           num_scenarios=10)
+    
+    # Print all test scenario arrival times
+    print("\nALL TEST SCENARIO ARRIVAL TIMES:")
+    print("-" * 50)
+    for i, scenario in enumerate(test_scenarios):
+        print(f"Scenario {i+1}: {scenario['arrival_times']}")
+        arrived_jobs = [j for j, t in scenario['arrival_times'].items() if t < float('inf')]
+        print(f"  Jobs arriving: {len(arrived_jobs)} ({sorted(arrived_jobs)})")
+        print()
+    
+    # Step 3: Train base agents (Dynamic and Static RL)
+    print("\n3. TRAINING PHASE")
+    print("-" * 40)
+    
+    print("Note: Perfect Knowledge RL will be trained separately for each test scenario")
+    print("This ensures each scenario has its optimal RL benchmark for comparison")
+    
+    # Train dynamic RL agent (knows arrival distribution only) - trained once
+
+    dynamic_model = train_dynamic_agent(ENHANCED_JOBS_DATA, MACHINE_LIST, 
+                                       initial_jobs=[0, 1, 2], arrival_rate=arrival_rate, 
+                                       total_timesteps=dynamic_timesteps,reward_mode="makespan_increment",learning_rate=learning_rate)
+
+    # Train static RL agent (assumes all jobs at t=0) - trained once
+    static_model = train_static_agent(ENHANCED_JOBS_DATA, MACHINE_LIST, total_timesteps=static_timesteps, 
+                                     reward_mode="makespan_increment", learning_rate=learning_rate)
+
+    # Analyze arrival time distribution during training
+    print("\n3.5. TRAINING ANALYSIS")
+    analyze_first_10_episodes()  # Show detailed first 10 episodes
+    # plot_training_metrics()      # Show PPO exploration metrics
+    # analyze_training_arrival_distribution()  # Show overall distribution
+    
+    # Step 4: Evaluate all methods on all test scenarios
+    print("\n4. EVALUATION PHASE - MULTIPLE SCENARIOS")
+    print("-" * 40)
+    print("Comparing three levels of arrival information across 10 test scenarios:")
+    print("1. Perfect Knowledge RL (knows exact arrival times)")
+    print("2. Dynamic RL (knows arrival distribution)")  
+    print("3. Static RL (assumes all jobs at t=0)")
+    
+    # Initialize results storage
+    all_results = {
+        'Perfect Knowledge RL': [],
+        'Dynamic RL': [],
+        'Static RL (dynamic)': [],
+        'Static RL (static)': [],
+        'Best Heuristic': [],
+        'MILP Optimal': []
+    }
+    
+    # Storage for first 3 scenarios for Gantt chart plotting
+    gantt_scenarios_data = []
+    
+    print(f"\nEvaluating on {len(test_scenarios)} test scenarios...")
+    
+    for i, scenario in enumerate(test_scenarios):
+        scenario_arrivals = scenario['arrival_times']
+        print(f"\nScenario {i+1}/10: {scenario_arrivals}")
+        # Train Perfect Knowledge RL specifically for this scenario
+        print(f"  Training Perfect Knowledge RL for scenario {i+1}...")
+        print(f"    Scenario arrival times: {scenario_arrivals}")
+        perfect_model = train_perfect_knowledge_agent(ENHANCED_JOBS_DATA, MACHINE_LIST, 
+                                                     arrival_times=scenario_arrivals, 
+                                                     total_timesteps=perfect_timesteps,
+                                                     reward_mode="makespan_increment", learning_rate=learning_rate)
+        
+        # Perfect Knowledge RL
+        perfect_makespan, perfect_schedule = evaluate_perfect_knowledge_on_scenario(
+            perfect_model, ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Perfect Knowledge RL'].append(perfect_makespan)
+        print(f"    Perfect RL trained specifically for this scenario: {perfect_makespan:.2f}")
+        
+        # Dynamic RL
+        dynamic_makespan, dynamic_schedule = evaluate_dynamic_on_dynamic(
+            dynamic_model, ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Dynamic RL'].append(dynamic_makespan)
+        
+        # Static RL (on dynamic scenario)
+        static_dynamic_makespan, static_dynamic_schedule = evaluate_static_on_dynamic(
+            static_model, ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Static RL (dynamic)'].append(static_dynamic_makespan)
+        
+        # Static RL (on static scenario) - only do once since it's always the same
+        if i == 0:
+            static_static_makespan, static_static_schedule = evaluate_static_on_static(
+                static_model, ENHANCED_JOBS_DATA, MACHINE_LIST)
+        all_results['Static RL (static)'].append(static_static_makespan)
+        
+        # Best Heuristic
+        spt_makespan, spt_schedule = spt_heuristic_poisson(ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['Best Heuristic'].append(spt_makespan)
+        
+        # MILP Optimal Solution
+        milp_makespan, milp_schedule = milp_optimal_scheduler(ENHANCED_JOBS_DATA, MACHINE_LIST, scenario_arrivals)
+        all_results['MILP Optimal'].append(milp_makespan)
+        
+        # Store ALL scenarios for Gantt plotting
+        gantt_scenarios_data.append({
+            'scenario_id': i,
+            'arrival_times': scenario_arrivals,
+            'schedules': {
+                'MILP Optimal': (milp_makespan, milp_schedule),
+                'Perfect Knowledge RL': (perfect_makespan, perfect_schedule),
+                'Dynamic RL': (dynamic_makespan, dynamic_schedule),
+                'Static RL (dynamic)': (static_dynamic_makespan, static_dynamic_schedule),
+                'Static RL (static)': (static_static_makespan, static_static_schedule),
+                'Best Heuristic': (spt_makespan, spt_schedule)
+            }
+        })
+        
+        # Verify all schedules for correctness
+        print(f"  Verifying schedule correctness for scenario {i+1}:")
+        
+        methods_to_verify = [
+            ("MILP Optimal", milp_makespan, milp_schedule),
+            ("Perfect Knowledge RL", perfect_makespan, perfect_schedule),
+            ("Dynamic RL", dynamic_makespan, dynamic_schedule),
+            ("Static RL (dynamic)", static_dynamic_makespan, static_dynamic_schedule),
+            ("Best Heuristic", spt_makespan, spt_schedule)
+        ]
+        
+        for method_name, reported_makespan, schedule in methods_to_verify:
+            if reported_makespan != float('inf') and schedule:
+                is_valid, true_makespan = verify_schedule_correctness(schedule, ENHANCED_JOBS_DATA, scenario_arrivals, method_name)
+                if is_valid:
+                    if abs(reported_makespan - true_makespan) > 0.01:
+                        print(f"    ⚠️  {method_name}: Makespan mismatch! Reported: {reported_makespan:.2f}, Actual: {true_makespan:.2f}")
+                        # Update the reported makespan to the correct one
+                        if method_name == "Perfect Knowledge RL":
+                            perfect_makespan = true_makespan
+                        elif method_name == "Dynamic RL":
+                            dynamic_makespan = true_makespan
+                        elif method_name == "Static RL (dynamic)":
+                            static_dynamic_makespan = true_makespan
+                    else:
+                        print(f"    ✅ {method_name}: Valid schedule, makespan: {true_makespan:.2f}")
+                else:
+                    print(f"    ❌ {method_name}: Invalid schedule!")
+                    # Mark as failed
+                    if method_name == "Perfect Knowledge RL":
+                        perfect_makespan = float('inf')
+                    elif method_name == "Dynamic RL":
+                        dynamic_makespan = float('inf')
+                    elif method_name == "Static RL (dynamic)":
+                        static_dynamic_makespan = float('inf')
+            else:
+                print(f"    ❌ {method_name}: No valid schedule!")
+        
+        # Check for duplicate schedules across methods (debugging identical results)
+        schedules_for_comparison = [
+            ("Perfect Knowledge RL", perfect_schedule),
+            ("Dynamic RL", dynamic_schedule),
+            ("Static RL (dynamic)", static_dynamic_schedule)
+        ]
+        
+        for i_method, (method1, sched1) in enumerate(schedules_for_comparison):
+            for j_method, (method2, sched2) in enumerate(schedules_for_comparison[i_method+1:], i_method+1):
+                if sched1 and sched2 and schedules_identical(sched1, sched2):
+                    print(f"    🚨 WARNING: {method1} and {method2} produced identical schedules!")
+        
+        print()  # Empty line for readability
+        
+        # Store first 3 scenarios for Gantt plotting
+        if i < 3:
+            gantt_scenarios_data.append({
+                'scenario_id': i,
+                'arrival_times': scenario_arrivals,
+                'schedules': {
+                    'MILP Optimal': (milp_makespan, milp_schedule),
+                    'Perfect Knowledge RL': (perfect_makespan, perfect_schedule),
+                    'Dynamic RL': (dynamic_makespan, dynamic_schedule),
+                    'Static RL (dynamic)': (static_dynamic_makespan, static_dynamic_schedule),
+                    'Static RL (static)': (static_static_makespan, static_static_schedule),
+                    'Best Heuristic': (spt_makespan, spt_schedule)
+                }
+            })
+        
+        print(f"  Results: Perfect={perfect_makespan:.2f}, Dynamic={dynamic_makespan:.2f}, Static(dyn)={static_dynamic_makespan:.2f}, Heuristic={spt_makespan:.2f}, MILP={milp_makespan:.2f}")
+        
+        # STRICT DEBUG: Check for impossible results and HALT execution if found
+        if milp_makespan != float('inf') and dynamic_makespan < milp_makespan - 0.001:  # Small tolerance for numerical precision
+            print(f"  🚨🚨🚨 FATAL ERROR: Dynamic RL ({dynamic_makespan:.2f}) outperformed MILP Optimal ({milp_makespan:.2f})!")
+            print(f"      This is THEORETICALLY IMPOSSIBLE - Dynamic RL cannot be better than MILP optimal!")
+            print(f"      Bug in: evaluation function, schedule validation, or MILP formulation")
+            print(f"      HALTING EXECUTION to investigate...")
+            exit(1)
+        
+        if milp_makespan != float('inf') and perfect_makespan < milp_makespan - 0.001:  # Small tolerance for numerical precision
+            print(f"  🚨🚨🚨 FATAL ERROR: Perfect Knowledge RL ({perfect_makespan:.2f}) outperformed MILP Optimal ({milp_makespan:.2f})!")
+            print(f"      This is THEORETICALLY IMPOSSIBLE - RL cannot be better than MILP optimal!")
+            print(f"      Bug in: evaluation function, schedule validation, or MILP formulation")
+            print(f"      HALTING EXECUTION to investigate...")
+            exit(1)
+        
+        if perfect_makespan > dynamic_makespan + 5.0:  # Increased tolerance for training variations
+            print(f"  🚨 WARNING: Perfect Knowledge RL ({perfect_makespan:.2f}) much worse than Dynamic RL ({dynamic_makespan:.2f})")
+            print(f"      Perfect RL should generally be better since it knows exact arrival times")
+            print(f"      This may indicate training issues or very difficult scenario")
+        
+        # Check if Dynamic RL is giving same result as previous scenarios
+        if i > 0 and abs(dynamic_makespan - all_results['Dynamic RL'][i-1]) < 0.01:
+            print(f"  🚨 SUSPICIOUS: Dynamic RL giving identical makespan to previous scenario")
+            print(f"      This suggests evaluation isn't properly using different arrival times")
+    
+    # Calculate average results
+    avg_results = {}
+    std_results = {}
+    for method, results in all_results.items():
+        valid_results = [r for r in results if r != float('inf')]
+        if valid_results:
+            avg_results[method] = np.mean(valid_results)
+            std_results[method] = np.std(valid_results)
+        else:
+            avg_results[method] = float('inf')
+            std_results[method] = 0
+    
+    # Use first scenario data for single-scenario analyses (backward compatibility)
+    first_scenario_arrivals = test_scenarios[0]['arrival_times']
+    static_arrivals = {job_id: 0.0 for job_id in ENHANCED_JOBS_DATA.keys()}
+    
+    # Get individual results from first scenario for single plots
+    perfect_makespan = all_results['Perfect Knowledge RL'][0]
+    dynamic_makespan = all_results['Dynamic RL'][0]  
+    static_dynamic_makespan = all_results['Static RL (dynamic)'][0]
+    static_static_makespan = all_results['Static RL (static)'][0]
+    spt_makespan = all_results['Best Heuristic'][0]
+    milp_makespan = all_results['MILP Optimal'][0]
+    
+    # Get schedules from first scenario
+    perfect_schedule = gantt_scenarios_data[0]['schedules']['Perfect Knowledge RL'][1]
+    dynamic_schedule = gantt_scenarios_data[0]['schedules']['Dynamic RL'][1]
+    static_dynamic_schedule = gantt_scenarios_data[0]['schedules']['Static RL (dynamic)'][1]
+    static_static_schedule = gantt_scenarios_data[0]['schedules']['Static RL (static)'][1]
+    spt_schedule = gantt_scenarios_data[0]['schedules']['Best Heuristic'][1]
+    milp_schedule = gantt_scenarios_data[0]['schedules']['MILP Optimal'][1]
+    
+    # Step 5: Results Analysis
+    print("\n5. RESULTS ANALYSIS")
+    print("=" * 60)
+    print("AVERAGE RESULTS ACROSS 10 TEST SCENARIOS:")
+    print(f"MILP Optimal              - Avg Makespan: {avg_results['MILP Optimal']:.2f} ± {std_results['MILP Optimal']:.2f}")
+    print(f"Perfect Knowledge RL      - Avg Makespan: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f}")
+    print(f"Dynamic RL (Poisson)      - Avg Makespan: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f}")  
+    print(f"Static RL (on dynamic)    - Avg Makespan: {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f}")
+    print(f"Static RL (on static)     - Avg Makespan: {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f}")
+    print(f"Best Heuristic            - Avg Makespan: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f}")
+    
+    print("\nFirst Scenario Results (for detailed analysis):")
+    print(f"MILP Optimal              - Makespan: {milp_makespan:.2f} (THEORETICAL BEST)")
+    print(f"Perfect Knowledge RL      - Makespan: {perfect_makespan:.2f}")
+    print(f"Dynamic RL (Poisson)      - Makespan: {dynamic_makespan:.2f}")  
+    print(f"Static RL (on dynamic)    - Makespan: {static_dynamic_makespan:.2f}")
+    print(f"Static RL (on static)     - Makespan: {static_static_makespan:.2f}")
+    print(f"Best Heuristic            - Makespan: {spt_makespan:.2f}")
+    
+    print("\nAverage Performance Ranking:")
+    avg_results_list = [
+        ("MILP Optimal", avg_results['MILP Optimal']),
+        ("Perfect Knowledge RL", avg_results['Perfect Knowledge RL']),
+        ("Dynamic RL", avg_results['Dynamic RL']), 
+        ("Static RL (dynamic)", avg_results['Static RL (dynamic)']),
+        ("Static RL (static)", avg_results['Static RL (static)']),
+        ("Best Heuristic", avg_results['Best Heuristic'])
+    ]
+    avg_results_list.sort(key=lambda x: x[1])
+    for i, (method, makespan) in enumerate(avg_results_list, 1):
+        if makespan == float('inf'):
+            print(f"{i}. {method}: Failed")
+        else:
+            print(f"{i}. {method}: {makespan:.2f}")
+    
+    print(f"\nExpected Performance Hierarchy:")
+    print(f"MILP Optimal ≤ Perfect Knowledge ≤ Dynamic RL ≤ Static RL")
+    if avg_results['MILP Optimal'] != float('inf'):
+        print(f"Actual Avg: {avg_results['MILP Optimal']:.2f} ≤ {avg_results['Perfect Knowledge RL']:.2f} ≤ {avg_results['Dynamic RL']:.2f} ≤ {avg_results['Static RL (dynamic)']:.2f}")
+    else:
+        print(f"Actual Avg (no MILP): {avg_results['Perfect Knowledge RL']:.2f} ≤ {avg_results['Dynamic RL']:.2f} ≤ {avg_results['Static RL (dynamic)']:.2f}")
+    
+    # Step 5.5: Average Regret Analysis (Gap from Optimal across all scenarios)
+    if avg_results['MILP Optimal'] != float('inf'):
+        avg_methods_results = {
+            "Perfect Knowledge RL": avg_results['Perfect Knowledge RL'],
+            "Dynamic RL": avg_results['Dynamic RL'],
+            "Static RL (dynamic)": avg_results['Static RL (dynamic)'],
+            "Static RL (static)": avg_results['Static RL (static)'],
+            "Best Heuristic": avg_results['Best Heuristic']
+        }
+        print("\nAVERAGE REGRET ANALYSIS:")
+        regret_results = calculate_regret_analysis(avg_results['MILP Optimal'], avg_methods_results)
+        
+        # Also calculate regret for each individual scenario
+        print("\nINDIVIDUAL SCENARIO REGRET ANALYSIS:")
+        all_regrets = {method: [] for method in avg_methods_results.keys()}
+        
+        for i in range(len(test_scenarios)):
+            if all_results['MILP Optimal'][i] != float('inf'):
+                scenario_methods = {
+                    "Perfect Knowledge RL": all_results['Perfect Knowledge RL'][i],
+                    "Dynamic RL": all_results['Dynamic RL'][i],
+                    "Static RL (dynamic)": all_results['Static RL (dynamic)'][i],
+                    "Static RL (static)": all_results['Static RL (static)'][i],
+                    "Best Heuristic": all_results['Best Heuristic'][i]
+                }
+                
+                optimal = all_results['MILP Optimal'][i]
+                for method, makespan in scenario_methods.items():
+                    if makespan != float('inf'):
+                        regret = ((makespan - optimal) / optimal) * 100
+                        all_regrets[method].append(regret)
+        
+        print("Regret Statistics (% above optimal):")
+        for method, regret_list in all_regrets.items():
+            if regret_list:
+                avg_regret = np.mean(regret_list)
+                std_regret = np.std(regret_list)
+                min_regret = np.min(regret_list)
+                max_regret = np.max(regret_list)
+                print(f"{method:25s}: {avg_regret:6.1f}% ± {std_regret:5.1f}% (range: {min_regret:.1f}% - {max_regret:.1f}%)")
+            else:
+                print(f"{method:25s}: No valid results")
+    
+    # Validate expected ordering
+    if perfect_makespan <= dynamic_makespan <= static_dynamic_makespan:
+        print("✅ EXPECTED: Perfect knowledge outperforms distribution knowledge outperforms no knowledge")
+    else:
+        print("❌ UNEXPECTED: Performance doesn't follow expected hierarchy")
+    
+    # Diagnose performance similarity issues
+    diagnose_performance_similarity(perfect_makespan, dynamic_makespan, static_dynamic_makespan, spt_makespan)
+    
+    # Performance comparisons
+    print("\n6. PERFORMANCE COMPARISON")
+    print("-" * 40)
+    
+    # Perfect Knowledge vs Dynamic RL
+    if perfect_makespan < dynamic_makespan:
+        perfect_advantage = ((dynamic_makespan - perfect_makespan) / dynamic_makespan) * 100
+        print(f"Perfect Knowledge advantage over Dynamic RL: {perfect_advantage:.1f}%")
+    
+    # Dynamic RL vs Static RL (on dynamic scenario)
+    if dynamic_makespan < static_dynamic_makespan:
+        improvement = ((static_dynamic_makespan - dynamic_makespan) / static_dynamic_makespan) * 100
+        print(f"✓ Dynamic RL outperforms Static RL (dynamic) by {improvement:.1f}%")
+    else:
+        gap = ((dynamic_makespan - static_dynamic_makespan) / static_dynamic_makespan) * 100
+        print(f"✗ Dynamic RL underperforms Static RL (dynamic) by {gap:.1f}%")
+    
+    # Static RL comparison: dynamic vs static scenarios
+    if static_static_makespan < static_dynamic_makespan:
+        improvement = ((static_dynamic_makespan - static_static_makespan) / static_dynamic_makespan) * 100
+        print(f"✓ Static RL performs {improvement:.1f}% better on static scenarios (as expected)")
+    else:
+        gap = ((static_static_makespan - static_dynamic_makespan) / static_static_makespan) * 100
+        print(f"⚠️ Unexpected: Static RL performs {gap:.1f}% worse on static scenarios")
+    
+    # Dynamic RL vs Best Heuristic
+    if dynamic_makespan < spt_makespan:
+        improvement = ((spt_makespan - dynamic_makespan) / spt_makespan) * 100
+        print(f"✓ Dynamic RL outperforms Best Heuristic by {improvement:.1f}%")
+    else:
+        gap = ((dynamic_makespan - spt_makespan) / spt_makespan) * 100
+        print(f"✗ Dynamic RL underperforms Best Heuristic by {gap:.1f}%")
+    
+    # Step 7: Generate Gantt Charts for Comparison
+    print(f"\n7. GANTT CHART COMPARISON")
+    print("-" * 60)
+    
+    # Main comparison with 4 plots (remove static RL on static from main plot)
+    num_plots = 5 if milp_makespan != float('inf') else 4
+    fig, axes = plt.subplots(num_plots, 1, figsize=(18, num_plots * 3.5))
+    
+    if milp_makespan != float('inf'):
+        fig.suptitle('Main Scheduling Comparison: MILP vs Perfect Knowledge vs Dynamic vs Static RL vs Best Heuristic\n' + 
+                     f'Test Scenario: Jobs 0-2 at t=0, Jobs 3-6 via Poisson arrivals\n' +
+                     f'Static RL evaluated on dynamic scenario with arrivals', 
+                     fontsize=16, fontweight='bold')
+        schedules_data = [
+            {'schedule': milp_schedule, 'makespan': milp_makespan, 'title': 'MILP Optimal (Benchmark)', 'arrival_times': first_scenario_arrivals},
+            {'schedule': perfect_schedule, 'makespan': perfect_makespan, 'title': 'Perfect Knowledge RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': dynamic_schedule, 'makespan': dynamic_makespan, 'title': 'Dynamic RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': static_dynamic_schedule, 'makespan': static_dynamic_makespan, 'title': 'Static RL (on dynamic scenario)', 'arrival_times': first_scenario_arrivals},
+            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'Best Heuristic', 'arrival_times': first_scenario_arrivals}
+        ]
+    else:
+        fig.suptitle('Main Scheduling Comparison: Perfect Knowledge vs Dynamic vs Static RL vs Best Heuristic\n' + 
+                     f'Test Scenario: Jobs 0-2 at t=0, Jobs 3-6 via Poisson arrivals\n' +
+                     f'Static RL evaluated on dynamic scenario with arrivals', 
+                     fontsize=16, fontweight='bold')
+        schedules_data = [
+            {'schedule': perfect_schedule, 'makespan': perfect_makespan, 'title': 'Perfect Knowledge RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': dynamic_schedule, 'makespan': dynamic_makespan, 'title': 'Dynamic RL', 'arrival_times': first_scenario_arrivals},
+            {'schedule': static_dynamic_schedule, 'makespan': static_dynamic_makespan, 'title': 'Static RL (on dynamic scenario)', 'arrival_times': first_scenario_arrivals},
+            {'schedule': spt_schedule, 'makespan': spt_makespan, 'title': 'Best Heuristic', 'arrival_times': first_scenario_arrivals}
+        ]
+    
+    colors = plt.cm.tab20.colors
+    
+    # Calculate the maximum makespan across all schedules for consistent scaling
+    max_makespan_for_scaling = 0
+    for data in schedules_data:
+        schedule = data['schedule']
+        if schedule and any(len(ops) > 0 for ops in schedule.values()):
+            schedule_max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+            max_makespan_for_scaling = max(max_makespan_for_scaling, schedule_max_time)
+    
+    # Add some padding (10%) for visual clarity
+    consistent_x_limit = max_makespan_for_scaling * 1.1 if max_makespan_for_scaling > 0 else 100
+    
+    for plot_idx, data in enumerate(schedules_data):
+        schedule = data['schedule']
+        makespan = data['makespan']
+        title = data['title']
+        arrival_times = data['arrival_times']
+        
+        ax = axes[plot_idx]
+        
+        if not schedule or all(len(ops) == 0 for ops in schedule.values()):
+            ax.text(0.5, 0.5, 'No valid schedule', ha='center', va='center', 
+                   transform=ax.transAxes, fontsize=14)
+            ax.set_title(f"{title} - No Solution")
+            # Still apply consistent scaling even for failed schedules
+            ax.set_xlim(0, consistent_x_limit)
+            ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)
+            continue
+        
+        # Plot operations for each machine
+        for idx, machine in enumerate(MACHINE_LIST):
+            machine_ops = schedule.get(machine, [])
+            machine_ops.sort(key=lambda x: x[1])  # Sort by start time
+            
+            for op_data in machine_ops:
+                if len(op_data) >= 3:
+                    job_op, start_time, end_time = op_data[:3]
+                    duration = end_time - start_time
+                    
+                    # Extract job number for coloring
+                    job_num = 0
+                    if 'J' in job_op:
+                        try:
+                            job_num = int(job_op.split('J')[1].split('-')[0])
+                        except:
+                            job_num = 0
+                    
+                    color = colors[job_num % len(colors)]
+                    
+                    ax.barh(idx, duration, left=start_time, height=0.6, 
+                           color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+                    
+                    # Add operation label
+                    if duration > 1:  # Only add text if bar is wide enough
+                        ax.text(start_time + duration/2, idx, job_op, 
+                               ha='center', va='center', fontsize=8, fontweight='bold')
+
+        # Add red arrows for job arrivals (only for dynamic jobs that arrive > 0)
+        if arrival_times:
+            arrow_y_position = len(MACHINE_LIST) + 0.3  # Position above all machines
+            for job_id, arrival_time in arrival_times.items():
+                if arrival_time > 0 and arrival_time < consistent_x_limit:  # Only show arrows for jobs that don't start at t=0 and arrive within time horizon
+                    # Draw vertical line for arrival
+                    ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=2)
+                    
+                    # Add arrow and label
+                    ax.annotate(f'Job {job_id} arrives', 
+                               xy=(arrival_time, arrow_y_position), 
+                               xytext=(arrival_time, arrow_y_position + 0.5),
+                               arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                               ha='center', va='bottom', color='red', fontweight='bold', fontsize=9,
+                               bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor='red', alpha=0.8))
+        
+        # Formatting
+        ax.set_yticks(range(len(MACHINE_LIST)))
+        ax.set_yticklabels(MACHINE_LIST)
+        ax.set_xlabel("Time" if plot_idx == len(schedules_data)-1 else "")
+        ax.set_ylabel("Machines")
+        ax.set_title(f"{title} (Makespan: {makespan:.2f})", fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        
+        # Apply consistent x-axis limits across all subplots
+        ax.set_xlim(0, consistent_x_limit)
+        ax.set_ylim(-0.5, len(MACHINE_LIST) + 2.0)  # Extra space for arrival arrows and labels
+    
+    # Add legend
+    legend_elements = []
+    for i in range(len(ENHANCED_JOBS_DATA)):
+        color = colors[i % len(colors)]
+        initial_or_poisson = ' (Initial)' if i < 3 else ' (Poisson)'
+        legend_elements.append(plt.Rectangle((0, 0), 1, 1, facecolor=color, 
+                                          alpha=0.8, label=f'Job {i}{initial_or_poisson}'))
+    
+    fig.legend(handles=legend_elements, loc='center', bbox_to_anchor=(0.5, 0.02), 
+              ncol=len(ENHANCED_JOBS_DATA), fontsize=10)
+    
+    plt.tight_layout(rect=[0, 0.08, 1, 0.95])
+    
+    # Save with appropriate filename based on MILP availability
+    if milp_makespan != float('inf'):
+        filename = 'complete_scheduling_comparison_with_milp_optimal.png'
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved comprehensive comparison with MILP optimal: {filename}")
+    else:
+        filename = 'dynamic_vs_static_gantt_comparison-7jobs.png'
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved comparison without MILP: {filename}")
+    
+    plt.show()
+    
+    # Skip the separate static RL comparison - focus on 10 test scenarios
+    # Step 8: Create Gantt Charts for All 10 Test Scenarios (5 methods only)
+    print(f"\n8. GANTT CHARTS FOR ALL 10 TEST SCENARIOS")
+    print("-" * 60)
+    
+    # Create small_instances folder
+    import os
+    folder_name = "small_instances_0.5rate"
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
+        print(f"Created folder: {folder_name}")
+    
+    # Generate Gantt charts for all 10 scenarios using stored data only
+    for scenario_idx in range(len(gantt_scenarios_data)):
+        scenario = gantt_scenarios_data[scenario_idx]
+        scenario_id = scenario['scenario_id']
+        arrival_times = scenario['arrival_times']
+        schedules = scenario['schedules']
+        print(f"\nGenerating Gantt chart for Test Scenario {scenario_id + 1}...")
+        print(f"Arrival times: {arrival_times}")
+        num_methods = 5 if schedules['MILP Optimal'][0] != float('inf') else 4
+        fig, axes = plt.subplots(num_methods, 1, figsize=(16, num_methods * 3))
+        if schedules['MILP Optimal'][0] != float('inf'):
+            fig.suptitle(f'Test Scenario {scenario_id + 1} - 5 Method Comparison\n' + 
+                         f'Arrival Times: {arrival_times}', 
+                         fontsize=14, fontweight='bold')
+            methods_to_plot = [
+                ('MILP Optimal', schedules['MILP Optimal']),
+                ('Perfect Knowledge RL', schedules['Perfect Knowledge RL']),
+                ('Dynamic RL', schedules['Dynamic RL']),
+                ('Static RL (dynamic)', schedules['Static RL (dynamic)']),
+                ('Best Heuristic', schedules['Best Heuristic'])
+            ]
+        else:
+            fig.suptitle(f'Test Scenario {scenario_id + 1} - 4 Method Comparison\n' + 
+                         f'Arrival Times: {arrival_times}', 
+                         fontsize=14, fontweight='bold')
+            methods_to_plot = [
+                ('Perfect Knowledge RL', schedules['Perfect Knowledge RL']),
+                ('Dynamic RL', schedules['Dynamic RL']),
+                ('Static RL (dynamic)', schedules['Static RL (dynamic)']),
+                ('Best Heuristic', schedules['Best Heuristic'])
+            ]
+        
+        # Calculate consistent x-axis limits for this scenario
+        max_time_scenario = 0
+        for method_name, (makespan, schedule) in methods_to_plot:
+            if schedule and any(len(ops) > 0 for ops in schedule.values()):
+                scenario_max_time = max([max([op[2] for op in ops]) for ops in schedule.values() if ops])
+                max_time_scenario = max(max_time_scenario, scenario_max_time)
+        
+        x_limit_scenario = max_time_scenario * 1.1 if max_time_scenario > 0 else 100
+        
+        # Plot each method
+        colors = plt.cm.tab20.colors
+        
+        for plot_idx, (method_name, (makespan, schedule)) in enumerate(methods_to_plot):
+            ax = axes[plot_idx] if num_methods > 1 else axes
+            
+            if not schedule or all(len(ops) == 0 for ops in schedule.values()):
+                ax.text(0.5, 0.5, 'No valid schedule', ha='center', va='center', 
+                       transform=ax.transAxes, fontsize=12)
+                ax.set_title(f"{method_name} - No Solution")
+                ax.set_xlim(0, x_limit_scenario)
+                ax.set_ylim(-0.5, len(MACHINE_LIST) + 1.5)
+                continue
+            
+            # Plot operations for each machine
+            for idx, machine in enumerate(MACHINE_LIST):
+                machine_ops = schedule.get(machine, [])
+                machine_ops.sort(key=lambda x: x[1])  # Sort by start time
+                
+                for op_data in machine_ops:
+                    if len(op_data) >= 3:
+                        job_op, start_time, end_time = op_data[:3]
+                        duration = end_time - start_time
+                        
+                        # Extract job number for coloring
+                        job_num = 0
+                        if 'J' in job_op:
+                            try:
+                                job_num = int(job_op.split('J')[1].split('-')[0])
+                            except (ValueError, IndexError):
+                                job_num = 0
+                        
+                        color = colors[job_num % len(colors)]
+                        
+                        ax.barh(idx, duration, left=start_time, height=0.6, 
+                               color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+                        
+                        # Add operation label
+                        if duration > 1:  # Only add text if bar is wide enough
+                            ax.text(start_time + duration/2, idx, job_op, 
+                                   ha='center', va='center', fontsize=8, fontweight='bold')
+        
+            # Add arrival arrows for jobs that arrive after t=0
+            arrow_y_position = len(MACHINE_LIST) + 0.2
+            for job_id, arrival_time in arrival_times.items():
+                if arrival_time > 0 and arrival_time < x_limit_scenario:
+                    ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=1.5)
+                    ax.annotate(f'J{job_id}', 
+                               xy=(arrival_time, arrow_y_position), 
+                               xytext=(arrival_time, arrow_y_position + 0.3),
+                               arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
+                               ha='center', va='bottom', color='red', fontweight='bold', fontsize=8,
+                               bbox=dict(boxstyle="round,pad=0.2", facecolor='white', edgecolor='red', alpha=0.8))
+            
+            # Formatting
+            ax.set_yticks(range(len(MACHINE_LIST)))
+            ax.set_yticklabels(MACHINE_LIST)
+            ax.set_xlabel("Time" if plot_idx == len(methods_to_plot)-1 else "")
+            ax.set_ylabel("Machines")
+            ax.set_title(f"{method_name} (Makespan: {makespan:.2f})", fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, x_limit_scenario)
+            ax.set_ylim(-0.5, len(MACHINE_LIST) + 1.5)
+        
+        # Add legend for jobs
+        legend_elements = []
+        for i in range(len(ENHANCED_JOBS_DATA)):
+            color = colors[i % len(colors)]
+            initial_or_dynamic = ' (Initial)' if i < 3 else ' (Dynamic)'
+            legend_elements.append(plt.Rectangle((0, 0), 1, 1, facecolor=color, 
+                                              alpha=0.8, label=f'Job {i}{initial_or_dynamic}'))
+        
+        fig.legend(handles=legend_elements, loc='center', bbox_to_anchor=(0.5, 0.02), 
+                  ncol=len(ENHANCED_JOBS_DATA), fontsize=9)
+        
+        plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+        
+        # Save scenario-specific Gantt chart in small_instances folder
+        scenario_filename = os.path.join(folder_name, f'test_scenario_{scenario_id + 1}_gantt_comparison.png')
+        plt.savefig(scenario_filename, dpi=300, bbox_inches='tight')
+        print(f"✅ Saved Test Scenario {scenario_id + 1} Gantt chart: {scenario_filename}")
+        
+        plt.close()  # Close figure to save memory
+    
+    print(f"\n✅ All 10 Gantt charts saved in {folder_name}/ folder")
+    
+    # Skip the old static RL comparison code - focus on the 10 test scenario Gantt charts above
+    
+    print("\n" + "=" * 80)
+    print("ANALYSIS COMPLETED!")
+    print("Generated files:")
+    if milp_makespan != float('inf'):
+        print("- complete_scheduling_comparison_with_milp_optimal.png: Five-method comprehensive comparison with MILP benchmark")
+        print(f"- small_instances/ folder: Contains 10 Gantt charts for all test scenarios (5 methods each)")
+        for i in range(10):
+            print(f"  ├── test_scenario_{i+1}_gantt_comparison.png")
+        print(f"\nKey Findings (Average across 10 test scenarios):")
+        print(f"• MILP Optimal (Benchmark): {avg_results['MILP Optimal']:.2f} ± {std_results['MILP Optimal']:.2f}")
+        print(f"• Perfect Knowledge RL: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f} (avg regret: +{((avg_results['Perfect Knowledge RL']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Dynamic RL: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f} (avg regret: +{((avg_results['Dynamic RL']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Static RL (on dynamic): {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f} (avg regret: +{((avg_results['Static RL (dynamic)']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Static RL (on static): {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f} (avg regret: +{((avg_results['Static RL (static)']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Best Heuristic: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f} (avg regret: +{((avg_results['Best Heuristic']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Perfect Knowledge RL validation: {'✅ Working well' if avg_results['Perfect Knowledge RL'] <= avg_results['MILP Optimal'] * 1.15 else '❌ Needs improvement'}")
+    else:
+        print("- dynamic_vs_static_gantt_comparison-7jobs.png: Five-method comparison")
+        print("- static_rl_dynamic_vs_static_comparison.png: Separate Static RL comparison (dynamic vs static scenarios)")  
+        print("- test_scenario_1_gantt_comparison.png: Detailed Gantt chart for Test Scenario 1")
+        print("- test_scenario_2_gantt_comparison.png: Detailed Gantt chart for Test Scenario 2")
+        print("- test_scenario_3_gantt_comparison.png: Detailed Gantt chart for Test Scenario 3")
+        print(f"\nKey Findings (Average across 10 test scenarios, no MILP benchmark available):")
+        print(f"• Perfect Knowledge RL: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f}")
+        print(f"• Dynamic RL: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f}")
+        print(f"• Static RL (on dynamic): {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f}")
+        print(f"• Static RL (on static): {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f}")
+        print(f"• Best Heuristic: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f}")
+        print(f"• Performance hierarchy: {'✅ Expected' if avg_results['Perfect Knowledge RL'] <= avg_results['Dynamic RL'] <= avg_results['Static RL (dynamic)'] else '❌ Unexpected'}")
+        print(f"• Static RL scenario comparison: {'✅ Better on static' if avg_results['Static RL (static)'] < avg_results['Static RL (dynamic)'] else '❌ Needs investigation'}")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
