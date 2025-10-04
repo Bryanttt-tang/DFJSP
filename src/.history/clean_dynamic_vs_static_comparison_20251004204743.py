@@ -690,13 +690,13 @@ class TrainingCallback:
         if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
             log_data = model.logger.name_to_value
             
-            # # DEBUG: Print all available log keys to see what's being logged
-            # if self.step_count % 100 == 0:  # Print every 100 calls to avoid spam
-            #     print(f"\n[DEBUG {self.method_name}] Available log keys: {list(log_data.keys())}")
-            #     if 'rollout/ep_rew_mean' in log_data:
-            #         print(f"[DEBUG {self.method_name}] Episode reward found: {log_data['rollout/ep_rew_mean']}")
-            #     else:
-            #         print(f"[DEBUG {self.method_name}] No episode reward in log_data")
+            # DEBUG: Print all available log keys to see what's being logged
+            if self.step_count % 100 == 0:  # Print every 100 calls to avoid spam
+                print(f"\n[DEBUG {self.method_name}] Available log keys: {list(log_data.keys())}")
+                if 'rollout/ep_rew_mean' in log_data:
+                    print(f"[DEBUG {self.method_name}] Episode reward found: {log_data['rollout/ep_rew_mean']}")
+                else:
+                    print(f"[DEBUG {self.method_name}] No episode reward in log_data")
             
             # Log entropy if available
             if 'train/entropy_loss' in log_data:
@@ -1307,15 +1307,15 @@ def plot_training_metrics():
     print(f"Policy loss records: {len(TRAINING_METRICS['policy_loss'])}")
     print(f"Value loss records: {len(TRAINING_METRICS['value_loss'])}")
     
-    # # DEBUG: Print actual episode rewards if available
-    # if TRAINING_METRICS['episode_rewards']:
-    #     rewards = TRAINING_METRICS['episode_rewards']
-    #     print(f"Episode rewards sample (first 10): {rewards[:10]}")
-    #     print(f"Episode rewards sample (last 10): {rewards[-10:]}")
-    #     print(f"Episode rewards range: {min(rewards):.4f} to {max(rewards):.4f}")
-    # else:
-    #     print("❌ NO EPISODE REWARDS RECORDED!")
-    #     print("This suggests the Monitor wrapper or callback is not working properly")
+    # DEBUG: Print actual episode rewards if available
+    if TRAINING_METRICS['episode_rewards']:
+        rewards = TRAINING_METRICS['episode_rewards']
+        print(f"Episode rewards sample (first 10): {rewards[:10]}")
+        print(f"Episode rewards sample (last 10): {rewards[-10:]}")
+        print(f"Episode rewards range: {min(rewards):.4f} to {max(rewards):.4f}")
+    else:
+        print("❌ NO EPISODE REWARDS RECORDED!")
+        print("This suggests the Monitor wrapper or callback is not working properly")
     
     # Create comprehensive figure with subplots
     fig, axes = plt.subplots(3, 2, figsize=(20, 15))

@@ -690,13 +690,13 @@ class TrainingCallback:
         if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
             log_data = model.logger.name_to_value
             
-            # # DEBUG: Print all available log keys to see what's being logged
-            # if self.step_count % 100 == 0:  # Print every 100 calls to avoid spam
-            #     print(f"\n[DEBUG {self.method_name}] Available log keys: {list(log_data.keys())}")
-            #     if 'rollout/ep_rew_mean' in log_data:
-            #         print(f"[DEBUG {self.method_name}] Episode reward found: {log_data['rollout/ep_rew_mean']}")
-            #     else:
-            #         print(f"[DEBUG {self.method_name}] No episode reward in log_data")
+            # DEBUG: Print all available log keys to see what's being logged
+            if self.step_count % 100 == 0:  # Print every 100 calls to avoid spam
+                print(f"\n[DEBUG {self.method_name}] Available log keys: {list(log_data.keys())}")
+                if 'rollout/ep_rew_mean' in log_data:
+                    print(f"[DEBUG {self.method_name}] Episode reward found: {log_data['rollout/ep_rew_mean']}")
+                else:
+                    print(f"[DEBUG {self.method_name}] No episode reward in log_data")
             
             # Log entropy if available
             if 'train/entropy_loss' in log_data:
@@ -1307,15 +1307,15 @@ def plot_training_metrics():
     print(f"Policy loss records: {len(TRAINING_METRICS['policy_loss'])}")
     print(f"Value loss records: {len(TRAINING_METRICS['value_loss'])}")
     
-    # # DEBUG: Print actual episode rewards if available
-    # if TRAINING_METRICS['episode_rewards']:
-    #     rewards = TRAINING_METRICS['episode_rewards']
-    #     print(f"Episode rewards sample (first 10): {rewards[:10]}")
-    #     print(f"Episode rewards sample (last 10): {rewards[-10:]}")
-    #     print(f"Episode rewards range: {min(rewards):.4f} to {max(rewards):.4f}")
-    # else:
-    #     print("❌ NO EPISODE REWARDS RECORDED!")
-    #     print("This suggests the Monitor wrapper or callback is not working properly")
+    # DEBUG: Print actual episode rewards if available
+    if TRAINING_METRICS['episode_rewards']:
+        rewards = TRAINING_METRICS['episode_rewards']
+        print(f"Episode rewards sample (first 10): {rewards[:10]}")
+        print(f"Episode rewards sample (last 10): {rewards[-10:]}")
+        print(f"Episode rewards range: {min(rewards):.4f} to {max(rewards):.4f}")
+    else:
+        print("❌ NO EPISODE REWARDS RECORDED!")
+        print("This suggests the Monitor wrapper or callback is not working properly")
     
     # Create comprehensive figure with subplots
     fig, axes = plt.subplots(3, 2, figsize=(20, 15))
@@ -3313,6 +3313,90 @@ def main():
                                color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
                         
                         # Add operation label
+                        if duration > 1:  # Only add text if bar is wide enough
+                            ax.text(start_time + duration/2, idx, job_op, 
+                                   ha='center', va='center', fontsize=8, fontweight='bold')
+
+        # Add arrival arrows for jobs that arrive after t=0
+        arrow_y_position = len(MACHINE_LIST) + 0.2
+        for job_id, arrival_time in arrival_times.items():
+            if arrival_time > 0 and arrival_time < x_limit_scenario:
+                ax.axvline(x=arrival_time, color='red', linestyle='--', alpha=0.7, linewidth=1.5)
+                ax.annotate(f'J{job_id}', 
+                           xy=(arrival_time, arrow_y_position), 
+                           xytext=(arrival_time, arrow_y_position + 0.3),
+                           arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
+                           ha='center', va='bottom', color='red', fontweight='bold', fontsize=8,
+                           bbox=dict(boxstyle="round,pad=0.2", facecolor='white', edgecolor='red', alpha=0.8))
+        
+        # Formatting
+        ax.set_yticks(range(len(MACHINE_LIST)))
+        ax.set_yticklabels(MACHINE_LIST)
+        ax.set_xlabel("Time" if plot_idx == len(methods_to_plot)-1 else "")
+        ax.set_ylabel("Machines")
+        ax.set_title(f"{method_name} (Makespan: {makespan:.2f})", fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(0, x_limit_scenario)
+        ax.set_ylim(-0.5, len(MACHINE_LIST) + 1.5)
+    
+    # Add legend for jobs
+    legend_elements = []
+    for i in range(len(ENHANCED_JOBS_DATA)):
+        color = colors[i % len(colors)]
+        initial_or_dynamic = ' (Initial)' if i < 3 else ' (Dynamic)'
+        legend_elements.append(plt.Rectangle((0, 0), 1, 1, facecolor=color, 
+                                          alpha=0.8, label=f'Job {i}{initial_or_dynamic}'))
+    
+    fig.legend(handles=legend_elements, loc='center', bbox_to_anchor=(0.5, 0.02), 
+              ncol=len(ENHANCED_JOBS_DATA), fontsize=9)
+    
+    plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+    
+    # Save scenario-specific Gantt chart in small_instances folder
+    scenario_filename = os.path.join(folder_name, f'test_scenario_{scenario_id + 1}_gantt_comparison.png')
+    plt.savefig(scenario_filename, dpi=300, bbox_inches='tight')
+    print(f"✅ Saved Test Scenario {scenario_id + 1} Gantt chart: {scenario_filename}")
+    
+    plt.close()  # Close figure to save memory
+    
+    print(f"\n✅ All 10 Gantt charts saved in {folder_name}/ folder")
+    
+    # Skip the old static RL comparison code - focus on the 10 test scenario Gantt charts above
+    
+    print("\n" + "=" * 80)
+    print("ANALYSIS COMPLETED!")
+    print("Generated files:")
+    if milp_makespan != float('inf'):
+        print("- complete_scheduling_comparison_with_milp_optimal.png: Five-method comprehensive comparison with MILP benchmark")
+        print(f"- small_instances/ folder: Contains 10 Gantt charts for all test scenarios (5 methods each)")
+        for i in range(10):
+            print(f"  ├── test_scenario_{i+1}_gantt_comparison.png")
+        print(f"\nKey Findings (Average across 10 test scenarios):")
+        print(f"• MILP Optimal (Benchmark): {avg_results['MILP Optimal']:.2f} ± {std_results['MILP Optimal']:.2f}")
+        print(f"• Perfect Knowledge RL: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f} (avg regret: +{((avg_results['Perfect Knowledge RL']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Dynamic RL: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f} (avg regret: +{((avg_results['Dynamic RL']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Static RL (on dynamic): {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f} (avg regret: +{((avg_results['Static RL (dynamic)']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Static RL (on static): {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f} (avg regret: +{((avg_results['Static RL (static)']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Best Heuristic: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f} (avg regret: +{((avg_results['Best Heuristic']-avg_results['MILP Optimal'])/avg_results['MILP Optimal']*100):.1f}%)")
+        print(f"• Perfect Knowledge RL validation: {'✅ Working well' if avg_results['Perfect Knowledge RL'] <= avg_results['MILP Optimal'] * 1.15 else '❌ Needs improvement'}")
+    else:
+        print("- dynamic_vs_static_gantt_comparison-7jobs.png: Five-method comparison")
+        print("- static_rl_dynamic_vs_static_comparison.png: Separate Static RL comparison (dynamic vs static scenarios)")  
+        print("- test_scenario_1_gantt_comparison.png: Detailed Gantt chart for Test Scenario 1")
+        print("- test_scenario_2_gantt_comparison.png: Detailed Gantt chart for Test Scenario 2")
+        print("- test_scenario_3_gantt_comparison.png: Detailed Gantt chart for Test Scenario 3")
+        print(f"\nKey Findings (Average across 10 test scenarios, no MILP benchmark available):")
+        print(f"• Perfect Knowledge RL: {avg_results['Perfect Knowledge RL']:.2f} ± {std_results['Perfect Knowledge RL']:.2f}")
+        print(f"• Dynamic RL: {avg_results['Dynamic RL']:.2f} ± {std_results['Dynamic RL']:.2f}")
+        print(f"• Static RL (on dynamic): {avg_results['Static RL (dynamic)']:.2f} ± {std_results['Static RL (dynamic)']:.2f}")
+        print(f"• Static RL (on static): {avg_results['Static RL (static)']:.2f} ± {std_results['Static RL (static)']:.2f}")
+        print(f"• Best Heuristic: {avg_results['Best Heuristic']:.2f} ± {std_results['Best Heuristic']:.2f}")
+        print(f"• Performance hierarchy: {'✅ Expected' if avg_results['Perfect Knowledge RL'] <= avg_results['Dynamic RL'] <= avg_results['Static RL (dynamic)'] else '❌ Unexpected'}")
+        print(f"• Static RL scenario comparison: {'✅ Better on static' if avg_results['Static RL (static)'] < avg_results['Static RL (dynamic)'] else '❌ Needs investigation'}")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
                         if duration > 1:  # Only add text if bar is wide enough
                             ax.text(start_time + duration/2, idx, job_op, 
                                    ha='center', va='center', fontsize=8, fontweight='bold')

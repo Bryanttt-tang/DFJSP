@@ -690,13 +690,13 @@ class TrainingCallback:
         if hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
             log_data = model.logger.name_to_value
             
-            # # DEBUG: Print all available log keys to see what's being logged
-            # if self.step_count % 100 == 0:  # Print every 100 calls to avoid spam
-            #     print(f"\n[DEBUG {self.method_name}] Available log keys: {list(log_data.keys())}")
-            #     if 'rollout/ep_rew_mean' in log_data:
-            #         print(f"[DEBUG {self.method_name}] Episode reward found: {log_data['rollout/ep_rew_mean']}")
-            #     else:
-            #         print(f"[DEBUG {self.method_name}] No episode reward in log_data")
+            # DEBUG: Print all available log keys to see what's being logged
+            if self.step_count % 100 == 0:  # Print every 100 calls to avoid spam
+                print(f"\n[DEBUG {self.method_name}] Available log keys: {list(log_data.keys())}")
+                if 'rollout/ep_rew_mean' in log_data:
+                    print(f"[DEBUG {self.method_name}] Episode reward found: {log_data['rollout/ep_rew_mean']}")
+                else:
+                    print(f"[DEBUG {self.method_name}] No episode reward in log_data")
             
             # Log entropy if available
             if 'train/entropy_loss' in log_data:
