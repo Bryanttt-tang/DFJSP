@@ -888,7 +888,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=1,
+        verbose=0,
         learning_rate=learning_rate,        # Matches test3_backup.py
         n_steps=2048,              # Matches test3_backup.py
         batch_size=128,            # Matches test3_backup.py  
@@ -936,7 +936,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=1,  # Minimal output
+        verbose=0,  # Minimal output
         learning_rate=learning_rate,
         n_steps=4096,          # Increased for larger job set
         batch_size=512,        # Increased for larger job set

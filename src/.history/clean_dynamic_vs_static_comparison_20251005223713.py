@@ -136,9 +136,8 @@ class PoissonDynamicFJSPEnv(gym.Env):
         
         self.operations_scheduled = 0
         self.episode_step = 0
-        # More reasonable max_episode_steps to prevent infinite loops
-        # Allow for total_operations + reasonable number of wait actions
-        self.max_episode_steps = self.total_operations * 3  # Allow more waits
+        # Reasonable max_episode_steps - should be close to total_operations for good agents
+        self.max_episode_steps = self.total_operations + 10  # Allow some WAIT actions but not many
         
         # Job arrival management - realistic dynamic scheduling
         self.arrived_jobs = set(self.initial_job_ids)  # Initial jobs available immediately
@@ -251,24 +250,26 @@ class PoissonDynamicFJSPEnv(gym.Env):
         return True
 
     def action_masks(self):
-        """BUILDER MODE: Generate action masks based on arrival, precedence, and compatibility."""
+        """Generate action masks - similar to PerfectKnowledgeFJSPEnv but only for arrived jobs."""
         mask = np.full(self.action_space.n, False, dtype=bool)
         
-        # If all operations are scheduled, no actions are valid.
+        # Check if terminal (all operations scheduled)
         if self.operations_scheduled >= self.total_operations:
-            return mask
+            return mask  # All actions invalid at terminal
 
         valid_scheduling_actions = 0
         
-        # Check scheduling actions for arrived jobs
+        # Check scheduling actions for arrived jobs only
         for job_idx, job_id in enumerate(self.job_ids):
+            # Only arrived jobs can be scheduled
             if job_id not in self.arrived_jobs:
                 continue
                 
             next_op_idx = self.next_operation[job_id]
             if next_op_idx >= len(self.jobs[job_id]):
-                continue
+                continue  # Job completed
                 
+            # Check each machine for compatibility
             for machine_idx, machine in enumerate(self.machines):
                 if machine in self.jobs[job_id][next_op_idx]['proc_times']:
                     action = (job_idx * self.max_ops_per_job * len(self.machines) + 
@@ -277,85 +278,108 @@ class PoissonDynamicFJSPEnv(gym.Env):
                         mask[action] = True
                         valid_scheduling_actions += 1
         
-        # The WAIT action is always an option unless the episode is over.
-        mask[self.WAIT_ACTION] = True
+        # WAIT action: always valid unless terminal (allows time advancement)
+        if self.operations_scheduled < self.total_operations:
+            mask[self.WAIT_ACTION] = True
+        
+        # If no valid actions, enable all to prevent deadlock
+        if valid_scheduling_actions == 0 and self.operations_scheduled < self.total_operations:
+            mask[self.WAIT_ACTION] = True
         
         return mask
 
     def _advance_to_next_arrival(self):
         """WAIT ACTION: Advance event_time to next job arrival or machine completion."""
+        # Find next arrival time after current event_time
         next_arrival_time = float('inf')
-        for job_id, arrival_time in self.job_arrival_times.items():
-            if job_id not in self.arrived_jobs and arrival_time != float('inf'):
-                next_arrival_time = min(next_arrival_time, arrival_time)
-
-        # If there are future arrivals, advance time to the next one.
-        if next_arrival_time != float('inf'):
-            self.event_time = next_arrival_time
-            # Update the set of arrived jobs
-            newly_arrived = set()
-            for job_id, arrival_time in self.job_arrival_times.items():
-                if arrival_time <= self.event_time:
-                    if job_id not in self.arrived_jobs:
-                        newly_arrived.add(job_id)
-            self.arrived_jobs.update(newly_arrived)
-            return len(newly_arrived) > 0
+        next_arriving_jobs = []
         
-        # If no future arrivals, it means we are waiting for a machine to be free.
-        # In this simplified model, we can just advance time by a fixed step.
-        self.event_time += 1.0
-        return False
+        for job_id, arrival_time in self.job_arrival_times.items():
+            if (job_id not in self.arrived_jobs and 
+                arrival_time > self.event_time and 
+                arrival_time != float('inf')):
+                if arrival_time < next_arrival_time:
+                    next_arrival_time = arrival_time
+                    next_arriving_jobs = [job_id]
+                elif arrival_time == next_arrival_time:
+                    next_arriving_jobs.append(job_id)
+        
+        # Find next machine completion time after current event_time
+        next_machine_completion = float('inf')
+        for machine, free_time in self.machine_next_free.items():
+            if free_time > self.event_time:
+                next_machine_completion = min(next_machine_completion, free_time)
+        # Choose the earliest next event
+        next_event_time = min(next_arrival_time, next_machine_completion)
+        
+        if next_event_time != float('inf'):
+            # Advance event_time to next event
+            self.event_time = next_event_time
+            
+            # Add newly arrived jobs if this was an arrival event
+            if next_event_time == next_arrival_time:
+                for job_id in next_arriving_jobs:
+                    self.arrived_jobs.add(job_id)
+                return len(next_arriving_jobs), next_event_time
+            else:
+                # This was a machine completion event
+                return 0, next_event_time
+        else:
+            # No more events - advance event_time minimally
+            self.event_time += 1.0
+            return 0, self.event_time
 
     def step(self, action):
-        """Simplified step function for Poisson Dynamic environment."""
+        """Simplified step function - similar to PerfectKnowledgeFJSPEnv."""
         self.episode_step += 1
         
-        # Terminate if all operations are scheduled
-        if self.operations_scheduled >= self.total_operations:
-            final_reward = 100 - self.current_makespan  # Bonus for finishing
-            return self._get_observation(), final_reward, True, False, {"makespan": self.current_makespan, "status": "completed"}
-
-        # Terminate if max steps reached (safety net)
+        # Safety check for infinite episodes
         if self.episode_step >= self.max_episode_steps:
-            penalty = -self.current_makespan - 100 # Penalize for not finishing
-            return self._get_observation(), penalty, True, False, {"error": "Max episode steps reached"}
+            return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
         
         job_idx, op_idx, machine_idx = self._decode_action(action)
 
-        # Handle WAIT action
-        if job_idx is None:
-            action_mask = self.action_masks()
-            # Check if there were any valid scheduling actions
-            scheduling_actions_available = np.any(action_mask[:-1])
+        # Handle WAIT action - simplified like PerfectKnowledgeFJSPEnv
+        if job_idx is None:  # WAIT action
+            # If all operations are scheduled, terminate immediately
+            if self.operations_scheduled >= self.total_operations:
+                return self._get_observation(), 0.0, True, False, {"action_type": "WAIT_AT_TERMINAL"}
             
-            # Advance time to the next event
-            new_arrival_happened = self._advance_to_next_arrival()
+            # Simple WAIT: just advance time by 1 unit and check for arrivals
+            self.current_makespan += 1.0
             
-            # Penalize waiting if other actions were possible
-            wait_reward = -5.0 if scheduling_actions_available else -1.0
+            # Check for newly arrived jobs
+            newly_arrived = []
+            for job_id, arrival_time in self.job_arrival_times.items():
+                if (job_id not in self.arrived_jobs and 
+                    arrival_time <= self.current_makespan and 
+                    arrival_time != float('inf')):
+                    self.arrived_jobs.add(job_id)
+                    newly_arrived.append(job_id)
             
-            # Check for termination after waiting
-            # If no new arrivals and no more jobs will ever arrive, and no actions are possible, terminate.
-            future_arrivals_possible = any(t < float('inf') for j, t in self.job_arrival_times.items() if j not in self.arrived_jobs)
-            if not new_arrival_happened and not future_arrivals_possible and not np.any(self.action_masks()[:-1]):
-                 return self._get_observation(), -100, True, False, {"error": "Stuck with no future arrivals"}
-
-            info = {"action_type": "WAIT", "event_time": self.event_time}
+            # Small penalty for waiting
+            wait_reward = -2.0
+            info = {
+                "makespan": self.current_makespan,
+                "newly_arrived_jobs": len(newly_arrived),
+                "action_type": "WAIT"
+            }
+            
             return self._get_observation(), wait_reward, False, False, info
 
-        # Handle scheduling action
+        # Handle scheduling action - same as PerfectKnowledgeFJSPEnv
         if not self._is_valid_action(job_idx, op_idx, machine_idx):
             return self._get_observation(), -50.0, False, False, {"error": "Invalid scheduling action"}
 
         job_id = self.job_ids[job_idx]
         machine = self.machines[machine_idx]
         
+        # Calculate timing
         machine_available_time = self.machine_next_free.get(machine, 0.0)
         job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
                          else self.job_arrival_times.get(job_id, 0.0))
         
-        # Start time must be after job arrival, machine is free, and current event time
-        start_time = max(machine_available_time, job_ready_time, self.event_time)
+        start_time = max(machine_available_time, job_ready_time)
         proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
         end_time = start_time + proc_time
 
@@ -367,20 +391,35 @@ class PoissonDynamicFJSPEnv(gym.Env):
         self.next_operation[job_id] += 1
         self.operations_scheduled += 1
         
+        # Update makespan and check for new arrivals
         self.current_makespan = max(self.current_makespan, end_time)
         
+        # Check for newly arrived jobs
+        newly_arrived = []
+        for job_id_check, arrival_time in self.job_arrival_times.items():
+            if (job_id_check not in self.arrived_jobs and 
+                arrival_time <= self.current_makespan and 
+                arrival_time != float('inf')):
+                self.arrived_jobs.add(job_id_check)
+                newly_arrived.append(job_id_check)
+
+        # Record in schedule
         self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
 
-        # Reward is the negative increase in makespan
-        reward = -(self.current_makespan - previous_makespan)
-        
-        info = {"makespan": self.current_makespan, "action_type": "SCHEDULE"}
-        
-        # Check for termination after scheduling
+        # Check termination - same as PerfectKnowledgeFJSPEnv
         terminated = self.operations_scheduled >= self.total_operations
-        if terminated:
-            reward += 100 - self.current_makespan # Add completion bonus
-
+        
+        # Calculate reward
+        idle_time = max(0, start_time - machine_available_time)
+        reward = self._calculate_reward(proc_time, idle_time, terminated, 
+                                      previous_makespan, self.current_makespan)
+        
+        info = {
+            "makespan": self.current_makespan,
+            "newly_arrived_jobs": len(newly_arrived),
+            "action_type": "SCHEDULE"
+        }
+        
         return self._get_observation(), reward, terminated, False, info
 
     def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan):
@@ -388,12 +427,8 @@ class PoissonDynamicFJSPEnv(gym.Env):
         
         if self.reward_mode == "makespan_increment":
             makespan_increment = current_makespan - previous_makespan
-            reward = -makespan_increment
-            if done:
-                reward += 100 - current_makespan # Final bonus
+            reward = -makespan_increment  # Negative increment
             return reward
-        # Fallback for other modes if needed
-        return -proc_time
 
     def _get_observation(self):
         """BUILDER MODE: Event-driven observation using event_time for arrival visibility."""
@@ -408,9 +443,10 @@ class PoissonDynamicFJSPEnv(gym.Env):
                 obs.append(0.0)
         
         # 2. Machine availability (normalized next_free times relative to event_time)
-        max_time_horizon = 100.0
+        max_time_horizon = 100.0  # For normalization
         for machine in self.machines:
             machine_free_time = self.machine_next_free[machine]
+            # How far ahead is this machine busy (relative to event_time)
             relative_busy_time = max(0, machine_free_time - self.event_time)
             normalized_busy = min(1.0, relative_busy_time / max_time_horizon)
             obs.append(normalized_busy)
@@ -435,8 +471,8 @@ class PoissonDynamicFJSPEnv(gym.Env):
                 for machine in self.machines:
                     obs.append(0.0)
         
-        # 4. DYNAMIC RL: Arrival pattern features
-        # Time since last arrival
+        # 4. DYNAMIC RL: Arrival pattern features (no direct future knowledge)
+        # Time since last arrival (based on event_time)
         if len(self.arrived_jobs) > 0:
             last_arrival_time = max(self.job_arrival_times.get(job_id, 0.0) for job_id in self.arrived_jobs)
             time_since_last_arrival = max(0, self.event_time - last_arrival_time)
@@ -448,11 +484,11 @@ class PoissonDynamicFJSPEnv(gym.Env):
         arrival_progress = len(self.arrived_jobs) / len(self.job_ids)
         obs.append(arrival_progress)
         
-        # Current event time (normalized)
-        normalized_event_time = min(1.0, self.event_time / self.max_time_horizon)
+        # Current event time (time context for event-driven decisions)
+        normalized_event_time = min(1.0, self.event_time / 100.0)
         obs.append(normalized_event_time)
         
-        # Fill remaining positions
+        # Fill remaining positions with zeros
         remaining_positions = len(self.job_ids) - 3
         for _ in range(remaining_positions):
             obs.append(0.0)
@@ -463,14 +499,313 @@ class PoissonDynamicFJSPEnv(gym.Env):
         return obs_array
 
 
+# class PerfectKnowledgeFJSPEnv(gym.Env):
+#     """
+#     BUILDER MODE Perfect Knowledge FJSP Environment.
+#     Knows exact arrival times, can schedule any job (arrived or not) with proper timing.
+#     """
+#     metadata = {"render.modes": ["human"]}
+
+#     def __init__(self, jobs_data, machine_list, arrival_times, reward_mode="makespan_increment"):
+#         super().__init__()
+#         self.jobs = jobs_data
+#         self.machines = machine_list
+#         self.job_ids = list(self.jobs.keys())
+#         self.num_jobs = len(self.job_ids)
+#         self.max_ops_per_job = max(len(ops) for ops in self.jobs.values()) if self.num_jobs > 0 else 1
+#         self.total_operations = sum(len(ops) for ops in self.jobs.values())
+#         self.reward_mode = reward_mode
+#         self.job_arrival_times = arrival_times.copy()
+        
+#         # Simplified action space without WAIT action (like possion_job_backup3.py)
+#         self.action_space = spaces.Discrete(
+#             min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
+#         )
+        
+#         # Perfect knowledge observation space (simplified like possion_job_backup3.py)
+#         obs_size = (
+#             self.num_jobs +                         # Ready job indicators
+#             len(self.machines) +                    # Machine idle status
+#             self.num_jobs * len(self.machines) +    # Processing times for ready ops
+#             self.num_jobs +                         # PERFECT ADVANTAGE: Exact future arrival times
+#             self.num_jobs * len(self.machines)      # PERFECT ADVANTAGE: Future job processing times
+#         )
+#         self.observation_space = spaces.Box(
+#             low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
+#         )
+        
+#     def reset(self, seed=None, options=None):
+#         """Reset environment for perfect knowledge builder mode."""
+#         if seed is not None:
+#             super().reset(seed=seed, options=options)
+#             random.seed(seed)
+#             np.random.seed(seed)
+        
+#         self.machine_next_free = {m: 0.0 for m in self.machines}
+#         self.schedule = {m: [] for m in self.machines}
+#         self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
+#         self.operation_end_times = {job_id: [0.0] * len(self.jobs[job_id]) for job_id in self.job_ids}
+#         self.next_operation = {job_id: 0 for job_id in self.job_ids}
+        
+#         self.current_makespan = 0.0
+#         self.operations_scheduled = 0
+#         self.episode_step = 0
+#         self.max_episode_steps = self.total_operations * 2
+        
+#         # All jobs available for scheduling with perfect knowledge (can plan ahead)
+#         self.arrived_jobs = set(self.job_ids)  # Perfect knowledge: can schedule all jobs
+        
+#         return self._get_observation(), {}
+
+#     def _decode_action(self, action):
+#         """Decode action - no WAIT action."""
+#         action = int(action) % self.action_space.n
+#         num_machines = len(self.machines)
+#         ops_per_job = self.max_ops_per_job
+        
+#         job_idx = action // (ops_per_job * num_machines)
+#         op_idx = (action % (ops_per_job * num_machines)) // num_machines
+#         machine_idx = action % num_machines
+        
+#         job_idx = min(job_idx, self.num_jobs - 1)
+#         machine_idx = min(machine_idx, len(self.machines) - 1)
+        
+#         return job_idx, op_idx, machine_idx
+
+#     def _is_valid_action(self, job_idx, op_idx, machine_idx):
+#         """Perfect knowledge validation: precedence + compatibility only."""
+#         if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
+#             return False
+        
+#         job_id = self.job_ids[job_idx]
+        
+#         # Check operation index validity
+#         if not (0 <= op_idx < len(self.jobs[job_id])):
+#             return False
+            
+#         # Check precedence: this must be the next operation for the job
+#         if op_idx != self.next_operation[job_id]:
+#             return False
+            
+#         # Check machine compatibility
+#         machine_name = self.machines[machine_idx]
+#         if machine_name not in self.jobs[job_id][op_idx]['proc_times']:
+#             return False
+            
+#         return True
+
+#     def action_masks(self):
+#         """Perfect knowledge action masks: precedence + compatibility."""
+#         mask = np.full(self.action_space.n, False, dtype=bool)
+        
+#         if self.operations_scheduled >= self.total_operations:
+#             return mask
+
+#         valid_action_count = 0
+        
+#         # All jobs can be scheduled (perfect knowledge)
+#         for job_idx, job_id in enumerate(self.job_ids):
+#             next_op_idx = self.next_operation[job_id]
+#             if next_op_idx >= len(self.jobs[job_id]):
+#                 continue
+                
+#             for machine_idx, machine in enumerate(self.machines):
+#                 if machine in self.jobs[job_id][next_op_idx]['proc_times']:
+#                     action = (job_idx * self.max_ops_per_job * len(self.machines) + 
+#                              next_op_idx * len(self.machines) + machine_idx)
+#                     if action < self.WAIT_ACTION:
+#                         mask[action] = True
+#                         valid_action_count += 1
+        
+#         # # WAIT action (though less useful with perfect knowledge)
+#         # if self.operations_scheduled < self.total_operations:
+#         #     mask[self.WAIT_ACTION] = True
+            
+#         return mask
+
+#     def step(self, action):
+#         """Perfect knowledge step function - similar to possion_job_backup3.py."""
+#         self.episode_step += 1
+        
+#         # Safety check for infinite episodes
+#         if self.episode_step >= self.max_episode_steps:
+#             return self._get_observation(), -1000.0, True, False, {"error": "Max episode steps reached"}
+        
+#         job_idx, op_idx, machine_idx = self._decode_action(action)
+
+#         # Use softer invalid action handling like possion_job_backup3.py
+#         if not self._is_valid_action(job_idx, op_idx, machine_idx):
+#             # Give a negative reward but don't terminate - helps learning
+#             return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
+
+#         job_id = self.job_ids[job_idx]
+#         machine = self.machines[machine_idx]
+        
+#         # Calculate timing using possion_job_backup3.py approach
+#         machine_available_time = self.machine_next_free.get(machine, 0.0)
+#         job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
+#                          else self.job_arrival_times.get(job_id, 0.0))
+        
+#         start_time = max(machine_available_time, job_ready_time)
+#         proc_time = self.jobs[job_id][op_idx]['proc_times'][machine]
+#         end_time = start_time + proc_time
+
+#         # Update state
+#         previous_makespan = self.current_makespan
+#         self.machine_next_free[machine] = end_time
+#         self.operation_end_times[job_id][op_idx] = end_time
+#         self.completed_ops[job_id][op_idx] = True
+#         self.next_operation[job_id] += 1
+#         self.operations_scheduled += 1
+        
+#         # Update makespan
+#         self.current_makespan = max(self.current_makespan, end_time)
+
+#         # Record in schedule
+#         self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
+
+#         # Check termination
+#         terminated = self.operations_scheduled >= self.total_operations
+        
+#         # Calculate reward
+#         idle_time = max(0, start_time - machine_available_time)
+#         reward = self._calculate_reward(proc_time, idle_time, terminated, 
+#                                       previous_makespan, self.current_makespan)
+        
+#         info = {"makespan": self.current_makespan}
+#         return self._get_observation(), reward, terminated, False, info
+    
+
+#     def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan):
+#         """Reward calculation for perfect knowledge - similar to possion_job_backup3.py."""
+        
+#         if self.reward_mode == "makespan_increment":
+#             # R(s_t, a_t) = E(t) - E(t+1) = negative increment in makespan
+#             if previous_makespan is not None and current_makespan is not None:
+#                 makespan_increment = current_makespan - previous_makespan
+#                 reward = -makespan_increment  # Negative increment (reward for not increasing makespan)
+#                 return reward
+#             else:
+#                 # Fallback if makespan values not provided
+#                 return -proc_time
+#         else:
+#             # Improved reward function with better guidance
+#             reward = 0.0
+            
+#             # Strong positive reward for completing an operation
+#             reward += 20.0
+            
+#             # Small penalty for processing time (encourage shorter operations)
+#             reward -= proc_time * 0.1
+            
+#             # Penalty for idle time (encourage efficiency)  
+#             reward -= idle_time * 1.0
+            
+#             # Large completion bonus
+#             if done:
+#                 reward += 200.0
+#                 # Bonus for shorter makespan
+#                 if current_makespan and current_makespan > 0:
+#                     reward += max(0, 500.0 / current_makespan)
+            
+#             return reward
+
+#     def _get_observation(self):
+#         """Perfect knowledge observation - similar to possion_job_backup3.py."""
+#         obs = []
+        
+#         # 1. Ready job indicators (binary: 1 if job has ready operation, 0 otherwise)
+#         for job_id in self.job_ids:
+#             if self.next_operation[job_id] < len(self.jobs[job_id]):
+#                 # Job has remaining operations
+#                 next_op_idx = self.next_operation[job_id]
+                
+#                 # Check if operation is ready (precedence satisfied)
+#                 if next_op_idx == 0:
+#                     # First operation: ready if job has arrived
+#                     job_ready_time = self.job_arrival_times.get(job_id, 0.0)
+#                     is_ready = self.current_makespan >= job_ready_time
+#                 else:
+#                     # Later operation: ready if previous operation completed
+#                     prev_completed = self.completed_ops[job_id][next_op_idx - 1]
+#                     is_ready = prev_completed
+                
+#                 obs.append(1.0 if is_ready else 0.0)
+#             else:
+#                 obs.append(0.0)  # Job completed or not ready
+        
+#         # 2. Machine idle status (binary: 1 if idle, 0 if busy)
+#         for machine in self.machines:
+#             machine_free_time = self.machine_next_free[machine]
+#             is_idle = machine_free_time <= self.current_makespan
+#             obs.append(1.0 if is_idle else 0.0)
+        
+#         # 3. Processing times for ready operations (normalized)
+#         max_proc_time = 10.0  # Reasonable upper bound for normalization
+        
+#         for job_id in self.job_ids:
+#             if self.next_operation[job_id] < len(self.jobs[job_id]):
+#                 next_op_idx = self.next_operation[job_id]
+#                 operation = self.jobs[job_id][next_op_idx]
+                
+#                 # Add processing time for each machine (0 if incompatible)
+#                 for machine in self.machines:
+#                     if machine in operation['proc_times']:
+#                         proc_time = operation['proc_times'][machine]
+#                         normalized_time = min(1.0, proc_time / max_proc_time)
+#                         obs.append(normalized_time)
+#                     else:
+#                         obs.append(0.0)  # Machine cannot process this operation
+#             else:
+#                 # Job completed: add zeros for processing times
+#                 for machine in self.machines:
+#                     obs.append(0.0)
+        
+#         # 4. PERFECT KNOWLEDGE ADVANTAGE: Exact future arrival times
+#         for job_id in self.job_ids:
+#             arrival_time = self.job_arrival_times.get(job_id, 0.0)
+#             if arrival_time > self.current_makespan:
+#                 # Job will arrive: provide exact arrival time information
+#                 delay = max(0, arrival_time - self.current_makespan)
+#                 normalized_delay = min(1.0, delay / 50.0)  # Normalize by 50 time units
+#                 obs.append(normalized_delay)
+#             else:
+#                 # Job already arrived: add zero (no future arrival)
+#                 obs.append(0.0)
+        
+#         # 5. PERFECT KNOWLEDGE ADVANTAGE: Processing times for future jobs' first operations
+#         for job_id in self.job_ids:
+#             if self.next_operation[job_id] == 0 and len(self.jobs[job_id]) > 0:
+#                 # Job not started yet: provide first operation processing times for planning
+#                 first_op = self.jobs[job_id][0]
+#                 for machine in self.machines:
+#                     if machine in first_op['proc_times']:
+#                         proc_time = first_op['proc_times'][machine]
+#                         normalized_proc = min(1.0, proc_time / max_proc_time)
+#                         obs.append(normalized_proc)
+#                     else:
+#                         obs.append(0.0)
+#             else:
+#                 # Job started or completed: add zeros
+#                 for machine in self.machines:
+#                     obs.append(0.0)
+        
+#         obs_array = np.array(obs, dtype=np.float32)
+#         obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
+        
+#         return obs_array
+
+
 class PerfectKnowledgeFJSPEnv(gym.Env):
     """
-    BUILDER MODE Perfect Knowledge FJSP Environment.
-    Knows exact arrival times, can schedule any job (arrived or not) with proper timing.
+    Dynamic FJSP Environment with PERFECT knowledge of specific arrival times.
+    
+    This environment is based on the working DynamicFJSPEnv from test3_backup.py
+    but uses deterministic arrival times instead of dynamic arrivals.
     """
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, jobs_data, machine_list, arrival_times, reward_mode="makespan_increment"):
+    def __init__(self, jobs_data, machine_list, arrival_times, reward_mode="makespan_increment", seed=None):
         super().__init__()
         self.jobs = jobs_data
         self.machines = machine_list
@@ -481,12 +816,12 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         self.reward_mode = reward_mode
         self.job_arrival_times = arrival_times.copy()
         
-        # Simplified action space without WAIT action (like possion_job_backup3.py)
+        # Action space - similar to test3_backup.py
         self.action_space = spaces.Discrete(
             min(self.num_jobs * self.max_ops_per_job * len(self.machines), 1000)
         )
         
-        # Perfect knowledge observation space (simplified like possion_job_backup3.py)
+        # EVENT-DRIVEN observation space with PERFECT KNOWLEDGE advantage
         obs_size = (
             self.num_jobs +                         # Ready job indicators
             len(self.machines) +                    # Machine idle status
@@ -499,12 +834,13 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         )
         
     def reset(self, seed=None, options=None):
-        """Reset environment for perfect knowledge builder mode."""
+        """Reset environment - based on test3_backup.py approach."""
         if seed is not None:
             super().reset(seed=seed, options=options)
             random.seed(seed)
             np.random.seed(seed)
         
+        # Initialize state similar to test3_backup.py DynamicFJSPEnv
         self.machine_next_free = {m: 0.0 for m in self.machines}
         self.schedule = {m: [] for m in self.machines}
         self.completed_ops = {job_id: [False] * len(self.jobs[job_id]) for job_id in self.job_ids}
@@ -516,13 +852,16 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         self.episode_step = 0
         self.max_episode_steps = self.total_operations * 2
         
-        # All jobs available for scheduling with perfect knowledge (can plan ahead)
-        self.arrived_jobs = set(self.job_ids)  # Perfect knowledge: can schedule all jobs
+        # Handle job arrivals at time 0 - deterministic
+        self.arrived_jobs = {
+            job_id for job_id, arrival_time in self.job_arrival_times.items()
+            if arrival_time <= 0
+        }
         
         return self._get_observation(), {}
 
     def _decode_action(self, action):
-        """Decode action - no WAIT action."""
+        """Decode action - same as test3_backup.py"""
         action = int(action) % self.action_space.n
         num_machines = len(self.machines)
         ops_per_job = self.max_ops_per_job
@@ -537,17 +876,21 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         return job_idx, op_idx, machine_idx
 
     def _is_valid_action(self, job_idx, op_idx, machine_idx):
-        """Perfect knowledge validation: precedence + compatibility only."""
+        """Check if action is valid - same as test3_backup.py"""
         if not (0 <= job_idx < self.num_jobs and 0 <= machine_idx < len(self.machines)):
             return False
         
         job_id = self.job_ids[job_idx]
         
+        # Check if job has arrived
+        if job_id not in self.arrived_jobs:
+            return False
+            
         # Check operation index validity
         if not (0 <= op_idx < len(self.jobs[job_id])):
             return False
             
-        # Check precedence: this must be the next operation for the job
+        # Check if this is the next operation
         if op_idx != self.next_operation[job_id]:
             return False
             
@@ -559,16 +902,16 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         return True
 
     def action_masks(self):
-        """Perfect knowledge action masks: precedence + compatibility."""
+        """Generate action masks - same as test3_backup.py"""
         mask = np.full(self.action_space.n, False, dtype=bool)
         
         if self.operations_scheduled >= self.total_operations:
             return mask
 
         valid_action_count = 0
-        
-        # All jobs can be scheduled (perfect knowledge)
         for job_idx, job_id in enumerate(self.job_ids):
+            if job_id not in self.arrived_jobs:
+                continue
             next_op_idx = self.next_operation[job_id]
             if next_op_idx >= len(self.jobs[job_id]):
                 continue
@@ -581,14 +924,13 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
                         mask[action] = True
                         valid_action_count += 1
         
-        # # WAIT action (though less useful with perfect knowledge)
-        # if self.operations_scheduled < self.total_operations:
-        #     mask[self.WAIT_ACTION] = True
+        if valid_action_count == 0:
+            mask.fill(True)
             
         return mask
 
     def step(self, action):
-        """Perfect knowledge step function - similar to possion_job_backup3.py."""
+        """Step function - improved version based on test3_backup.py"""
         self.episode_step += 1
         
         # Safety check for infinite episodes
@@ -597,7 +939,7 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         
         job_idx, op_idx, machine_idx = self._decode_action(action)
 
-        # Use softer invalid action handling like possion_job_backup3.py
+        # Use softer invalid action handling like test3_backup.py
         if not self._is_valid_action(job_idx, op_idx, machine_idx):
             # Give a negative reward but don't terminate - helps learning
             return self._get_observation(), -50.0, False, False, {"error": "Invalid action, continuing"}
@@ -605,7 +947,7 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         job_id = self.job_ids[job_idx]
         machine = self.machines[machine_idx]
         
-        # Calculate timing using possion_job_backup3.py approach
+        # Calculate timing using test3_backup.py approach
         machine_available_time = self.machine_next_free.get(machine, 0.0)
         job_ready_time = (self.operation_end_times[job_id][op_idx - 1] if op_idx > 0 
                          else self.job_arrival_times.get(job_id, 0.0))
@@ -622,8 +964,17 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         self.next_operation[job_id] += 1
         self.operations_scheduled += 1
         
-        # Update makespan
+        # Update makespan and check for new arrivals (key improvement)
         self.current_makespan = max(self.current_makespan, end_time)
+        
+        # Check for newly arrived jobs (deterministic)
+        newly_arrived = []
+        for job_id_check, arrival_time in self.job_arrival_times.items():
+            if (job_id_check not in self.arrived_jobs and 
+                arrival_time <= self.current_makespan and 
+                arrival_time != float('inf')):
+                self.arrived_jobs.add(job_id_check)
+                newly_arrived.append(job_id_check)
 
         # Record in schedule
         self.schedule[machine].append((f"J{job_id}-O{op_idx+1}", start_time, end_time))
@@ -631,23 +982,26 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         # Check termination
         terminated = self.operations_scheduled >= self.total_operations
         
-        # Calculate reward
+        # Calculate reward using test3_backup.py style
         idle_time = max(0, start_time - machine_available_time)
         reward = self._calculate_reward(proc_time, idle_time, terminated, 
                                       previous_makespan, self.current_makespan)
         
         info = {"makespan": self.current_makespan}
         return self._get_observation(), reward, terminated, False, info
-    
 
     def _calculate_reward(self, proc_time, idle_time, done, previous_makespan, current_makespan):
-        """Reward calculation for perfect knowledge - similar to possion_job_backup3.py."""
-        
+        """Reward calculation based on test3_backup.py approach"""
         if self.reward_mode == "makespan_increment":
             # R(s_t, a_t) = E(t) - E(t+1) = negative increment in makespan
             if previous_makespan is not None and current_makespan is not None:
                 makespan_increment = current_makespan - previous_makespan
                 reward = -makespan_increment  # Negative increment (reward for not increasing makespan)
+                
+                # # Add small completion bonus
+                # if done:
+                #     reward += 50.0
+                    
                 return reward
             else:
                 # Fallback if makespan values not provided
@@ -673,15 +1027,25 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
                     reward += max(0, 500.0 / current_makespan)
             
             return reward
-
+    
     def _get_observation(self):
-        """Perfect knowledge observation - similar to possion_job_backup3.py."""
+        """
+        EVENT-DRIVEN MINIMAL OBSERVATION for fully observed MDP.
+        
+        Only includes information needed for immediate assignment decision:
+        1. Which jobs have ready operations (available now)
+        2. Processing times for ready operations on each machine
+        3. Which machines are currently idle
+        
+        PERFECT KNOWLEDGE VERSION: Includes complete future arrival information.
+        """
         obs = []
         
         # 1. Ready job indicators (binary: 1 if job has ready operation, 0 otherwise)
         for job_id in self.job_ids:
-            if self.next_operation[job_id] < len(self.jobs[job_id]):
-                # Job has remaining operations
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
+                # Job has arrived and has remaining operations
                 next_op_idx = self.next_operation[job_id]
                 
                 # Check if operation is ready (precedence satisfied)
@@ -696,7 +1060,7 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
                 
                 obs.append(1.0 if is_ready else 0.0)
             else:
-                obs.append(0.0)  # Job completed or not ready
+                obs.append(0.0)  # Job not ready or not arrived
         
         # 2. Machine idle status (binary: 1 if idle, 0 if busy)
         for machine in self.machines:
@@ -708,7 +1072,8 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
         max_proc_time = 10.0  # Reasonable upper bound for normalization
         
         for job_id in self.job_ids:
-            if self.next_operation[job_id] < len(self.jobs[job_id]):
+            if (job_id in self.arrived_jobs and 
+                self.next_operation[job_id] < len(self.jobs[job_id])):
                 next_op_idx = self.next_operation[job_id]
                 operation = self.jobs[job_id][next_op_idx]
                 
@@ -721,26 +1086,31 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
                     else:
                         obs.append(0.0)  # Machine cannot process this operation
             else:
-                # Job completed: add zeros for processing times
+                # Job not ready or arrived: add zeros for processing times
                 for machine in self.machines:
                     obs.append(0.0)
         
         # 4. PERFECT KNOWLEDGE ADVANTAGE: Exact future arrival times
         for job_id in self.job_ids:
-            arrival_time = self.job_arrival_times.get(job_id, 0.0)
-            if arrival_time > self.current_makespan:
-                # Job will arrive: provide exact arrival time information
-                delay = max(0, arrival_time - self.current_makespan)
-                normalized_delay = min(1.0, delay / 50.0)  # Normalize by 50 time units
-                obs.append(normalized_delay)
+            if job_id not in self.arrived_jobs:
+                # Job not arrived yet: provide exact arrival time
+                arrival_time = self.job_arrival_times.get(job_id, float('inf'))
+                if arrival_time != float('inf'):
+                    # Job will arrive: provide exact arrival time information
+                    delay = max(0, arrival_time - self.current_makespan)
+                    normalized_delay = min(1.0, delay / 50.0)  # Normalize by 50 time units (longer horizon)
+                    obs.append(normalized_delay)
+                else:
+                    # Job won't arrive: add zero
+                    obs.append(0.0)
             else:
                 # Job already arrived: add zero (no future arrival)
                 obs.append(0.0)
         
         # 5. PERFECT KNOWLEDGE ADVANTAGE: Processing times for future jobs' first operations
         for job_id in self.job_ids:
-            if self.next_operation[job_id] == 0 and len(self.jobs[job_id]) > 0:
-                # Job not started yet: provide first operation processing times for planning
+            if job_id not in self.arrived_jobs and len(self.jobs[job_id]) > 0:
+                # Job not arrived yet: provide first operation processing times for planning
                 first_op = self.jobs[job_id][0]
                 for machine in self.machines:
                     if machine in first_op['proc_times']:
@@ -748,16 +1118,24 @@ class PerfectKnowledgeFJSPEnv(gym.Env):
                         normalized_proc = min(1.0, proc_time / max_proc_time)
                         obs.append(normalized_proc)
                     else:
-                        obs.append(0.0)
+                        obs.append(0.0)  # Machine cannot process this operation
             else:
-                # Job started or completed: add zeros
+                # Job already arrived or no operations: add zeros
                 for machine in self.machines:
                     obs.append(0.0)
+        
+        # Ensure correct size and format
+        target_size = self.observation_space.shape[0]
+        if len(obs) < target_size:
+            obs.extend([0.0] * (target_size - len(obs)))
+        elif len(obs) > target_size:
+            obs = obs[:target_size]
         
         obs_array = np.array(obs, dtype=np.float32)
         obs_array = np.nan_to_num(obs_array, nan=0.0, posinf=1.0, neginf=0.0)
         
         return obs_array
+
 
 def reset_training_metrics():
     """Reset TRAINING_METRICS for a new training run."""
@@ -2595,7 +2973,7 @@ def main():
     print("📊 DEBUGGING: Action entropy & training metrics tracking enabled")
     print("🚨 STRICT VALIDATION: Will halt execution if any RL outperforms MILP optimal")
     print("=" * 80)
-    arrival_rate = 0.5  # LOWER arrival rate to create more dynamic scenarios
+    arrival_rate = 0.1  # LOWER arrival rate to create more dynamic scenarios
     # With λ=0.5, expected inter-arrival = 2 time units (faster than most job operations)
     
     # Step 1: Training Setup

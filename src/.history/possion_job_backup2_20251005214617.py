@@ -936,7 +936,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=1,  # Minimal output
+        verbose=0,  # Minimal output
         learning_rate=learning_rate,
         n_steps=4096,          # Increased for larger job set
         batch_size=512,        # Increased for larger job set
