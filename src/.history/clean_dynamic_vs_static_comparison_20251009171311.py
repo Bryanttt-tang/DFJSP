@@ -1989,7 +1989,7 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
     test_env = PoissonDynamicFJSPEnv(
         jobs_data, machine_list,
         initial_jobs=[k for k, v in arrival_times.items() if v == 0],
-        arrival_rate=0.05,  # Rate doesn't matter since we'll override
+        arrival_rate=0.1,  # Rate doesn't matter since we'll override
         reward_mode=reward_mode,
         seed=GLOBAL_SEED,
         max_time_horizon=max([t for t in arrival_times.values() if t != float('inf')] + [200])

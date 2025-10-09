@@ -1128,7 +1128,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,
+        verbose=1,
         learning_rate=learning_rate,        # IDENTICAL across all RL methods
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=128,            # IDENTICAL across all RL methods
@@ -1184,7 +1184,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     with tqdm(total=total_timesteps, desc=f"Perfect Knowledge RL", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Perfect Knowledge RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Perfect Knowledge RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     # More thorough post-training evaluation
@@ -1241,7 +1241,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,  # Minimal output
+        verbose=1,  # Minimal output
         learning_rate=learning_rate,
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=128,            # IDENTICAL across all RL methods
@@ -1270,7 +1270,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     with tqdm(total=total_timesteps, desc="Static RL Training", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Static RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Static RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
@@ -1308,7 +1308,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,
+        verbose=1,
         learning_rate=learning_rate,        # IDENTICAL across all RL methods
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=256,            # IDENTICAL across all RL methods
@@ -1337,7 +1337,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     with tqdm(total=total_timesteps, desc="Dynamic RL Training", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Dynamic RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Dynamic RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
@@ -1581,7 +1581,7 @@ def plot_training_metrics():
     plt.tight_layout()
     plt.savefig(f'enhanced_ppo_training_metrics_{TRAINING_METRICS.get("method_name", "RL Agent")}.png', dpi=300, bbox_inches='tight')
     print(f"✅ Enhanced training metrics plot saved: enhanced_ppo_training_metrics_{TRAINING_METRICS.get('method_name', 'RL Agent')}.png")
-    plt.pause(1)
+    plt.show()
     # print_training_summary()
 
 def print_training_summary():
@@ -1725,94 +1725,94 @@ def print_training_summary():
     
     print("=" * 50)
 
-# def analyze_training_arrival_distribution():
-#     """
-#     Analyze and plot the distribution of arrival times during training.
-#     This helps identify if the dynamic RL is seeing diverse enough scenarios.
-#     """
-#     global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
+def analyze_training_arrival_distribution():
+    """
+    Analyze and plot the distribution of arrival times during training.
+    This helps identify if the dynamic RL is seeing diverse enough scenarios.
+    """
+    global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
     
-#     if not TRAINING_ARRIVAL_TIMES:
-#         print("No arrival times recorded during training!")
-#         return
+    if not TRAINING_ARRIVAL_TIMES:
+        print("No arrival times recorded during training!")
+        return
     
-#     print(f"\n=== TRAINING ARRIVAL DISTRIBUTION ANALYSIS ===")
-#     print(f"Total episodes: {TRAINING_EPISODE_COUNT}")
-#     print(f"Total dynamic arrivals recorded: {len(TRAINING_ARRIVAL_TIMES)}")
-#     print(f"Average arrivals per episode: {len(TRAINING_ARRIVAL_TIMES)/max(TRAINING_EPISODE_COUNT,1):.2f}")
+    print(f"\n=== TRAINING ARRIVAL DISTRIBUTION ANALYSIS ===")
+    print(f"Total episodes: {TRAINING_EPISODE_COUNT}")
+    print(f"Total dynamic arrivals recorded: {len(TRAINING_ARRIVAL_TIMES)}")
+    print(f"Average arrivals per episode: {len(TRAINING_ARRIVAL_TIMES)/max(TRAINING_EPISODE_COUNT,1):.2f}")
     
-#     # Statistics
-#     arrival_times = np.array(TRAINING_ARRIVAL_TIMES)
-#     print(f"Arrival time statistics:")
-#     print(f"  Min: {np.min(arrival_times):.2f}")
-#     print(f"  Max: {np.max(arrival_times):.2f}")
-#     print(f"  Mean: {np.mean(arrival_times):.2f}")
-#     print(f"  Std: {np.std(arrival_times):.2f}")
+    # Statistics
+    arrival_times = np.array(TRAINING_ARRIVAL_TIMES)
+    print(f"Arrival time statistics:")
+    print(f"  Min: {np.min(arrival_times):.2f}")
+    print(f"  Max: {np.max(arrival_times):.2f}")
+    print(f"  Mean: {np.mean(arrival_times):.2f}")
+    print(f"  Std: {np.std(arrival_times):.2f}")
     
-#     # Create distribution plot
-#     plt.figure(figsize=(15, 10))
+    # Create distribution plot
+    plt.figure(figsize=(15, 10))
     
-#     # Plot 1: Histogram of arrival times
-#     plt.subplot(2, 2, 1)
-#     plt.hist(arrival_times, bins=50, alpha=0.7, edgecolor='black')
-#     plt.xlabel('Arrival Time')
-#     plt.ylabel('Frequency')
-#     plt.title(f'Distribution of Job Arrival Times During Training\n({len(TRAINING_ARRIVAL_TIMES)} arrivals across {TRAINING_EPISODE_COUNT} episodes)')
-#     plt.grid(True, alpha=0.3)
+    # Plot 1: Histogram of arrival times
+    plt.subplot(2, 2, 1)
+    plt.hist(arrival_times, bins=50, alpha=0.7, edgecolor='black')
+    plt.xlabel('Arrival Time')
+    plt.ylabel('Frequency')
+    plt.title(f'Distribution of Job Arrival Times During Training\n({len(TRAINING_ARRIVAL_TIMES)} arrivals across {TRAINING_EPISODE_COUNT} episodes)')
+    plt.grid(True, alpha=0.3)
     
-#     # Plot 2: Box plot
-#     plt.subplot(2, 2, 2)
-#     plt.boxplot(arrival_times, vert=True)
-#     plt.ylabel('Arrival Time')
-#     plt.title('Box Plot of Arrival Times')
-#     plt.grid(True, alpha=0.3)
+    # Plot 2: Box plot
+    plt.subplot(2, 2, 2)
+    plt.boxplot(arrival_times, vert=True)
+    plt.ylabel('Arrival Time')
+    plt.title('Box Plot of Arrival Times')
+    plt.grid(True, alpha=0.3)
     
-#     # Plot 3: Cumulative distribution
-#     plt.subplot(2, 2, 3)
-#     sorted_arrivals = np.sort(arrival_times)
-#     y_vals = np.arange(1, len(sorted_arrivals) + 1) / len(sorted_arrivals)
-#     plt.plot(sorted_arrivals, y_vals, linewidth=2)
-#     plt.xlabel('Arrival Time')
-#     plt.ylabel('Cumulative Probability')
-#     plt.title('Cumulative Distribution of Arrival Times')
-#     plt.grid(True, alpha=0.3)
+    # Plot 3: Cumulative distribution
+    plt.subplot(2, 2, 3)
+    sorted_arrivals = np.sort(arrival_times)
+    y_vals = np.arange(1, len(sorted_arrivals) + 1) / len(sorted_arrivals)
+    plt.plot(sorted_arrivals, y_vals, linewidth=2)
+    plt.xlabel('Arrival Time')
+    plt.ylabel('Cumulative Probability')
+    plt.title('Cumulative Distribution of Arrival Times')
+    plt.grid(True, alpha=0.3)
     
-#     # Plot 4: Inter-arrival times
-#     if len(arrival_times) > 1:
-#         plt.subplot(2, 2, 4)
-#         # Group by episodes and calculate inter-arrival times within episodes
-#         inter_arrivals = []
-#         episode_arrivals = []
-#         current_episode_times = []
+    # Plot 4: Inter-arrival times
+    if len(arrival_times) > 1:
+        plt.subplot(2, 2, 4)
+        # Group by episodes and calculate inter-arrival times within episodes
+        inter_arrivals = []
+        episode_arrivals = []
+        current_episode_times = []
         
-#         # Simple approximation: assume arrivals are chronological within batches
-#         sorted_times = np.sort(arrival_times)
-#         for i in range(1, len(sorted_times)):
-#             inter_arrival = sorted_times[i] - sorted_times[i-1]
-#             if inter_arrival > 0 and inter_arrival < 100:  # Filter reasonable inter-arrivals
-#                 inter_arrivals.append(inter_arrival)
+        # Simple approximation: assume arrivals are chronological within batches
+        sorted_times = np.sort(arrival_times)
+        for i in range(1, len(sorted_times)):
+            inter_arrival = sorted_times[i] - sorted_times[i-1]
+            if inter_arrival > 0 and inter_arrival < 100:  # Filter reasonable inter-arrivals
+                inter_arrivals.append(inter_arrival)
         
-#         if inter_arrivals:
-#             plt.hist(inter_arrivals, bins=30, alpha=0.7, edgecolor='black')
-#             plt.xlabel('Inter-arrival Time')
-#             plt.ylabel('Frequency')
-#             plt.title(f'Distribution of Inter-arrival Times\n(Mean: {np.mean(inter_arrivals):.2f})')
-#             plt.grid(True, alpha=0.3)
+        if inter_arrivals:
+            plt.hist(inter_arrivals, bins=30, alpha=0.7, edgecolor='black')
+            plt.xlabel('Inter-arrival Time')
+            plt.ylabel('Frequency')
+            plt.title(f'Distribution of Inter-arrival Times\n(Mean: {np.mean(inter_arrivals):.2f})')
+            plt.grid(True, alpha=0.3)
     
-#     plt.tight_layout()
-#     plt.savefig('training_arrival_distribution.png', dpi=300, bbox_inches='tight')
-#     plt.pause(1)
-
-#     # Check if distribution is diverse enough
-#     unique_times = len(np.unique(np.round(arrival_times, 1)))
-#     print(f"\nDiversity Analysis:")
-#     print(f"  Unique arrival times (rounded to 0.1): {unique_times}")
-#     print(f"  Time span: {np.max(arrival_times) - np.min(arrival_times):.2f}")
+    plt.tight_layout()
+    plt.savefig('training_arrival_distribution.png', dpi=300, bbox_inches='tight')
+    plt.show()
     
-#     if unique_times < 20:
-#         print("⚠️  WARNING: Low diversity in arrival times may limit learning")
-#     else:
-#         print("✅ Good diversity in arrival times")
+    # Check if distribution is diverse enough
+    unique_times = len(np.unique(np.round(arrival_times, 1)))
+    print(f"\nDiversity Analysis:")
+    print(f"  Unique arrival times (rounded to 0.1): {unique_times}")
+    print(f"  Time span: {np.max(arrival_times) - np.min(arrival_times):.2f}")
+    
+    if unique_times < 20:
+        print("⚠️  WARNING: Low diversity in arrival times may limit learning")
+    else:
+        print("✅ Good diversity in arrival times")
 
 
 def create_perfect_knowledge_scenario(base_scenario):
@@ -1989,7 +1989,7 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
     test_env = PoissonDynamicFJSPEnv(
         jobs_data, machine_list,
         initial_jobs=[k for k, v in arrival_times.items() if v == 0],
-        arrival_rate=0.05,  # Rate doesn't matter since we'll override
+        arrival_rate=0.1,  # Rate doesn't matter since we'll override
         reward_mode=reward_mode,
         seed=GLOBAL_SEED,
         max_time_horizon=max([t for t in arrival_times.values() if t != float('inf')] + [200])
@@ -2436,27 +2436,27 @@ def validate_schedule_makespan(schedule, jobs_data, arrival_times):
     
     return max_completion
 
-# def milp_optimal_scheduler(jobs_data, machine_list, arrival_times):
-#     """
-#     MILP approach for optimal dynamic scheduling with perfect knowledge.
+def milp_optimal_scheduler(jobs_data, machine_list, arrival_times):
+    """
+    MILP approach for optimal dynamic scheduling with perfect knowledge.
     
-#     This provides the theoretical optimal solution for the perfect knowledge case,
-#     serving as the benchmark for regret calculation and verification of the
-#     perfect knowledge RL agent performance.
+    This provides the theoretical optimal solution for the perfect knowledge case,
+    serving as the benchmark for regret calculation and verification of the
+    perfect knowledge RL agent performance.
     
-#     Args:
-#         jobs_data: Dictionary of job data with processing times
-#         machine_list: List of available machines
-#         arrival_times: Dictionary of exact arrival times for each job
+    Args:
+        jobs_data: Dictionary of job data with processing times
+        machine_list: List of available machines
+        arrival_times: Dictionary of exact arrival times for each job
         
-#     Returns:
-#         tuple: (optimal_makespan, optimal_schedule) or (float('inf'), empty_schedule) if failed
-#     """
-#     import pickle
-#     import os
-#     import hashlib
+    Returns:
+        tuple: (optimal_makespan, optimal_schedule) or (float('inf'), empty_schedule) if failed
+    """
+    import pickle
+    import os
+    import hashlib
     
-    # CACHE CLEARING: Remove all existing MILP cache files to force fresh computation
+    # # CACHE CLEARING: Remove all existing MILP cache files to force fresh computation
     # cache_files = [f for f in os.listdir('.') if f.startswith('milp_cache_') and f.endswith('.pkl')]
     # for cache_file in cache_files:
     #     try:
@@ -2465,294 +2465,116 @@ def validate_schedule_makespan(schedule, jobs_data, arrival_times):
     #     except:
     #         pass
 
-#     print("\n--- Running MILP Optimal Scheduler ---")
-#     print(f"Jobs: {len(jobs_data)}, Machines: {len(machine_list)}")
-#     print(f"Arrival times: {arrival_times}")
+    print("\n--- Running MILP Optimal Scheduler ---")
+    print(f"Jobs: {len(jobs_data)}, Machines: {len(machine_list)}")
+    print(f"Arrival times: {arrival_times}")
     
-#     try:
-#         prob = LpProblem("PerfectKnowledge_FJSP_Optimal", LpMinimize)
+    try:
+        prob = LpProblem("PerfectKnowledge_FJSP_Optimal", LpMinimize)
         
-#         # Generate all operations
-#         ops = [(j, oi) for j in jobs_data for oi in range(len(jobs_data[j]))]
-#         BIG_M = 1000  # Large constant for disjunctive constraints (increased for safety)
+        # Generate all operations
+        ops = [(j, oi) for j in jobs_data for oi in range(len(jobs_data[j]))]
+        BIG_M = 1000  # Large constant for disjunctive constraints (increased for safety)
 
-#         # Decision variables
-#         x = LpVariable.dicts("x", (ops, machine_list), cat="Binary")  # Assignment variables
-#         s = LpVariable.dicts("s", ops, lowBound=0)                    # Start time variables
-#         c = LpVariable.dicts("c", ops, lowBound=0)                    # Completion time variables
-#         y = LpVariable.dicts("y", (ops, ops, machine_list), cat="Binary")  # Sequencing variables
-#         Cmax = LpVariable("Cmax", lowBound=0)                         # Makespan variable
+        # Decision variables
+        x = LpVariable.dicts("x", (ops, machine_list), cat="Binary")  # Assignment variables
+        s = LpVariable.dicts("s", ops, lowBound=0)                    # Start time variables
+        c = LpVariable.dicts("c", ops, lowBound=0)                    # Completion time variables
+        y = LpVariable.dicts("y", (ops, ops, machine_list), cat="Binary")  # Sequencing variables
+        Cmax = LpVariable("Cmax", lowBound=0)                         # Makespan variable
 
-#         # Objective: minimize makespan
-#         prob += Cmax
+        # Objective: minimize makespan
+        prob += Cmax
 
-#         # Constraints
-#         for j, oi in ops:
-#             # 1. Assignment constraint: each operation must be assigned to exactly one compatible machine
-#             compatible_machines = [m for m in machine_list if m in jobs_data[j][oi]['proc_times']]
-#             prob += lpSum(x[j, oi][m] for m in compatible_machines) == 1
+        # Constraints
+        for j, oi in ops:
+            # 1. Assignment constraint: each operation must be assigned to exactly one compatible machine
+            compatible_machines = [m for m in machine_list if m in jobs_data[j][oi]['proc_times']]
+            prob += lpSum(x[j, oi][m] for m in compatible_machines) == 1
             
-#             # 2. Completion time definition
-#             prob += c[j, oi] == s[j, oi] + lpSum(
-#                 x[j, oi][m] * jobs_data[j][oi]['proc_times'][m] 
-#                 for m in compatible_machines
-#             )
+            # 2. Completion time definition
+            prob += c[j, oi] == s[j, oi] + lpSum(
+                x[j, oi][m] * jobs_data[j][oi]['proc_times'][m] 
+                for m in compatible_machines
+            )
             
-#             # 3. Precedence constraints within jobs
-#             if oi > 0:
-#                 prob += s[j, oi] >= c[j, oi - 1]
-#             else:
-#                 # 4. Arrival time constraint for first operation of each job
-#                 prob += s[j, oi] >= arrival_times.get(j, 0)
+            # 3. Precedence constraints within jobs
+            if oi > 0:
+                prob += s[j, oi] >= c[j, oi - 1]
+            else:
+                # 4. Arrival time constraint for first operation of each job
+                prob += s[j, oi] >= arrival_times.get(j, 0)
             
-#             # 5. Makespan definition
-#             prob += Cmax >= c[j, oi]
+            # 5. Makespan definition
+            prob += Cmax >= c[j, oi]
 
-#         # 6. Disjunctive constraints for machine capacity
-#         for m in machine_list:
-#             ops_on_m = [op for op in ops if m in jobs_data[op[0]][op[1]]['proc_times']]
-#             for i in range(len(ops_on_m)):
-#                 for k in range(i + 1, len(ops_on_m)):
-#                     op1, op2 = ops_on_m[i], ops_on_m[k]
-                    
-#                     # Create binary variable to check if both operations are on this machine
-#                     both_on_m = LpVariable(f"both_{op1}_{op2}_on_{m}", cat="Binary")
-#                     prob += both_on_m <= x[op1][m]
-#                     prob += both_on_m <= x[op2][m]
-#                     prob += both_on_m >= x[op1][m] + x[op2][m] - 1
-                    
-#                     # Either op1 before op2 or op2 before op1 (only if both assigned to machine m)
-#                     prob += s[op1] >= c[op2] - BIG_M * (1 - y[op1][op2][m]) - BIG_M * (1 - both_on_m)
-#                     prob += s[op2] >= c[op1] - BIG_M * y[op1][op2][m] - BIG_M * (1 - both_on_m)
-
-#         # Solve with time limit
-#         print("Solving MILP optimization problem...")
-#         prob.solve(PULP_CBC_CMD(msg=False, timeLimit=300))  # 5-minute time limit
-        
-#         # Extract solution
-#         schedule = {m: [] for m in machine_list}
-        
-#         if prob.status == 1 and Cmax.varValue is not None:  # Optimal solution found
-#             optimal_makespan = Cmax.varValue
-            
-#             # Extract schedule from solution
-#             for (j, oi), m in ((op, m) for op in ops for m in machine_list):
-#                 if m in jobs_data[j][oi]['proc_times'] and x[j, oi][m].varValue > 0.5:
-#                     start_time = s[j, oi].varValue
-#                     end_time = c[j, oi].varValue
-#                     schedule[m].append((f"J{j}-O{oi+1}", start_time, end_time))
-            
-#             # Sort operations by start time for each machine
-#             for m in machine_list:
-#                 schedule[m].sort(key=lambda x: x[1])
-            
-#             # CRITICAL VALIDATION: Verify MILP schedule is actually valid
-#             print(f"🔍 VALIDATING MILP SOLUTION...")
-#             actual_makespan = validate_schedule_makespan(schedule, jobs_data, arrival_times)
-            
-#             if abs(actual_makespan - optimal_makespan) > 0.001:
-#                 print(f"❌ MILP VALIDATION FAILED!")
-#                 print(f"   MILP claimed makespan: {optimal_makespan:.2f}")
-#                 print(f"   Actual schedule makespan: {actual_makespan:.2f}")
-#                 print(f"   This explains why RL appears to beat MILP - MILP solution is invalid!")
-#                 return float('inf'), {}  # Return invalid result
-            
-#             print(f"✅ MILP OPTIMAL SOLUTION VALIDATED!")
-#             print(f"   Optimal Makespan: {optimal_makespan:.2f}")
-#             print(f"   This represents the THEORETICAL BEST possible performance")
-#             print(f"   with perfect knowledge of arrival times: {arrival_times}")
-            
-#             # DO NOT cache result - force fresh computation each time for debugging
-#             print(f"   ⚠️  Caching disabled for debugging - fresh computation each run")
-            
-#             return optimal_makespan, schedule
-            
-#         else:
-#             print(f"❌ MILP solver failed to find optimal solution (status: {prob.status})")
-#             print("   Possible reasons: problem too complex, time limit exceeded, or infeasible")
-#             return float('inf'), schedule
-            
-#     except Exception as e:
-#         print(f"❌ MILP solver error: {e}")
-#         return float('inf'), {m: [] for m in machine_list}
-
-def milp_optimal_scheduler(jobs_data, machine_list, arrival_times, time_limit=300, verbose=True):
-    """
-    MILP approach for optimal dynamic scheduling with perfect knowledge.
-
-    Args:
-        jobs_data: dict mapping job_id -> list of operations, where each op is a dict:
-                   e.g. jobs_data[j] = [ {'proc_times': {'M1': 3, 'M2':5}}, ... ]
-        machine_list: list of machine names (strings)
-        arrival_times: dict mapping job_id -> arrival_time (float)
-        time_limit: CBC time limit in seconds
-        verbose: if True prints solver progress
-
-    Returns:
-        (optimal_makespan, schedule) or (float('inf'), {}) if failed.
-        schedule is dict: machine -> list of (op_name, start, end)
-    """
-    # Imports required for pulp
-    from pulp import (LpProblem, LpMinimize, LpVariable, lpSum, PULP_CBC_CMD, LpStatus)
-    import math
-    import os
-    import itertools
-
-    cache_files = [f for f in os.listdir('.') if f.startswith('milp_cache_') and f.endswith('.pkl')]
-    for cache_file in cache_files:
-        try:
-            os.remove(cache_file)
-            print(f"🧹 Cleared cache file: {cache_file}")
-        except:
-            pass
-
-    # Check that validate_schedule_makespan exists
-    if 'validate_schedule_makespan' not in globals():
-        raise RuntimeError("validate_schedule_makespan(...) must be defined in the environment.")
-
-    # Build list of operations (job_id, op_index)
-    ops = [(j, oi) for j in jobs_data for oi in range(len(jobs_data[j]))]
-
-    # Compute safe BIG_M: total processing time + max arrival
-    all_proc_times = []
-    for j, oi in ops:
-        all_proc_times.extend(jobs_data[j][oi]['proc_times'].values())
-    total_proc = sum(all_proc_times) if all_proc_times else 0.0
-    max_arrival = max(arrival_times.values()) if arrival_times else 0.0
-    BIG_M = total_proc + max_arrival + 1.0  # safe upper bound
-
-    # Create problem
-    prob = LpProblem("PerfectKnowledge_FJSP_Optimal", LpMinimize)
-
-    # Decision variables
-    # x[(j,oi)][m] = 1 if operation (j,oi) assigned to machine m
-    x = {}
-    for op in ops:
-        x[op] = {}
-        j, oi = op
+        # 6. Disjunctive constraints for machine capacity
         for m in machine_list:
-            if m in jobs_data[j][oi]['proc_times']:
-                x[op][m] = LpVariable(f"x_{j}_{oi}_on_{m}", cat="Binary")
+            ops_on_m = [op for op in ops if m in jobs_data[op[0]][op[1]]['proc_times']]
+            for i in range(len(ops_on_m)):
+                for k in range(i + 1, len(ops_on_m)):
+                    op1, op2 = ops_on_m[i], ops_on_m[k]
+                    
+                    # Create binary variable to check if both operations are on this machine
+                    both_on_m = LpVariable(f"both_{op1}_{op2}_on_{m}", cat="Binary")
+                    prob += both_on_m <= x[op1][m]
+                    prob += both_on_m <= x[op2][m]
+                    prob += both_on_m >= x[op1][m] + x[op2][m] - 1
+                    
+                    # Either op1 before op2 or op2 before op1 (only if both assigned to machine m)
+                    prob += s[op1] >= c[op2] - BIG_M * (1 - y[op1][op2][m]) - BIG_M * (1 - both_on_m)
+                    prob += s[op2] >= c[op1] - BIG_M * y[op1][op2][m] - BIG_M * (1 - both_on_m)
 
-    # start and completion times
-    s = {op: LpVariable(f"s_{op[0]}_{op[1]}", lowBound=0) for op in ops}
-    c = {op: LpVariable(f"c_{op[0]}_{op[1]}", lowBound=0) for op in ops}
-
-    # Makespan
-    Cmax = LpVariable("Cmax", lowBound=0)
-
-    # Objective
-    prob += Cmax
-
-    # Constraints
-    for op in ops:
-        j, oi = op
-        # 1. assignment to exactly one compatible machine
-        compatible_machines = [m for m in machine_list if m in jobs_data[j][oi]['proc_times']]
-        if not compatible_machines:
-            # infeasible: operation has no machine
-            if verbose:
-                print(f"Operation {op} has no compatible machines -> infeasible")
-            return float('inf'), {}
-
-        prob += lpSum(x[op][m] for m in compatible_machines) == 1
-
-        # 2. completion time = start + processing time (depends on chosen machine)
-        prob += c[op] == s[op] + lpSum(x[op][m] * jobs_data[j][oi]['proc_times'][m] for m in compatible_machines)
-
-        # 3. precedence in job
-        if oi > 0:
-            prev = (j, oi - 1)
-            prob += s[op] >= c[prev]
-        else:
-            # arrival time constraint
-            arr = arrival_times.get(j, 0)
-            prob += s[op] >= arr
-
-        # 4. makespan
-        prob += Cmax >= c[op]
-
-    # 5. disjunctive sequencing only for pairs that share at least one machine
-    # Create sequencing vars y only for relevant triples
-    # y[op1][op2][m] = 1 if op1 before op2 on machine m
-    y = {}
-    for m in machine_list:
-        # operations compatible with m
-        ops_on_m = [op for op in ops if m in jobs_data[op[0]][op[1]]['proc_times']]
-        # pairwise sequencing
-        for op1_idx in range(len(ops_on_m)):
-            for op2_idx in range(op1_idx + 1, len(ops_on_m)):
-                op1 = ops_on_m[op1_idx]
-                op2 = ops_on_m[op2_idx]
-
-                # create sequencing binary var only for this pair+machine
-                y_key = (op1, op2, m)
-                y[y_key] = LpVariable(f"y_{op1[0]}_{op1[1]}__{op2[0]}_{op2[1]}__on_{m}", cat="Binary")
-
-                # optional: create both_on_m using linearization of AND
-                both_name = f"both_{op1[0]}_{op1[1]}__{op2[0]}_{op2[1]}__on_{m}"
-                both_on_m = LpVariable(both_name, cat="Binary")
-                prob += both_on_m <= x[op1][m]
-                prob += both_on_m <= x[op2][m]
-                prob += both_on_m >= x[op1][m] + x[op2][m] - 1
-
-                # sequencing constraints (big-M): if both_on_m == 1 then either op1 before op2 or op2 before op1
-                # op1 after op2 unless y==1 (meaning op1 before op2)
-                prob += s[op1] >= c[op2] - BIG_M * (1 - y[y_key]) - BIG_M * (1 - both_on_m)
-                # op2 after op1 unless y==0 (so op2 >= c_op1 - M*y)
-                prob += s[op2] >= c[op1] - BIG_M * y[y_key] - BIG_M * (1 - both_on_m)
-
-    # Solve
-    solver = PULP_CBC_CMD(msg=1 if verbose else 0, timeLimit=time_limit)
-    prob.solve(solver)
-
-    # Check status
-    status = LpStatus[prob.status]
-    if verbose:
-        print("Solver status:", status)
-    if LpStatus[prob.status] == "Optimal":
-        print("✅ True optimal solution found.")
-    else:
-        print("⚠️  Feasible but not proven optimal.")
-
-    schedule = {m: [] for m in machine_list}
-    if status == "Optimal" or status == "Not Solved" or status == "Optimal":  # Prefer explicit 'Optimal' but accept near-optimal?
-        # If solver found values for Cmax
-        try:
-            optimal_makespan = float(Cmax.varValue) if Cmax.varValue is not None else float('inf')
-        except Exception:
-            optimal_makespan = float('inf')
-
-        # Build schedule from x and s/c variable values
-        for op in ops:
-            j, oi = op
+        # Solve with time limit
+        print("Solving MILP optimization problem...")
+        prob.solve(PULP_CBC_CMD(msg=False, timeLimit=300))  # 5-minute time limit
+        
+        # Extract solution
+        schedule = {m: [] for m in machine_list}
+        
+        if prob.status == 1 and Cmax.varValue is not None:  # Optimal solution found
+            optimal_makespan = Cmax.varValue
+            
+            # Extract schedule from solution
+            for (j, oi), m in ((op, m) for op in ops for m in machine_list):
+                if m in jobs_data[j][oi]['proc_times'] and x[j, oi][m].varValue > 0.5:
+                    start_time = s[j, oi].varValue
+                    end_time = c[j, oi].varValue
+                    schedule[m].append((f"J{j}-O{oi+1}", start_time, end_time))
+            
+            # Sort operations by start time for each machine
             for m in machine_list:
-                if m in jobs_data[j][oi]['proc_times'] and (op in x and m in x[op]):
-                    xv = x[op][m].varValue
-                    if xv is not None and xv > 0.5:
-                        st = float(s[op].varValue) if s[op].varValue is not None else None
-                        en = float(c[op].varValue) if c[op].varValue is not None else None
-                        schedule[m].append((f"J{j}-O{oi+1}", st, en))
-
-        # sort schedule per machine
-        for m in schedule:
-            schedule[m].sort(key=lambda tup: (tup[1] if tup[1] is not None else math.inf))
-
-        # Validate using provided function
-        actual_makespan = validate_schedule_makespan(schedule, jobs_data, arrival_times)
-        if math.isfinite(actual_makespan) and abs(actual_makespan - optimal_makespan) <= 1e-6:
-            if verbose:
-                print("✅ MILP solution validated. Makespan = ", optimal_makespan)
+                schedule[m].sort(key=lambda x: x[1])
+            
+            # CRITICAL VALIDATION: Verify MILP schedule is actually valid
+            print(f"🔍 VALIDATING MILP SOLUTION...")
+            actual_makespan = validate_schedule_makespan(schedule, jobs_data, arrival_times)
+            
+            if abs(actual_makespan - optimal_makespan) > 0.001:
+                print(f"❌ MILP VALIDATION FAILED!")
+                print(f"   MILP claimed makespan: {optimal_makespan:.2f}")
+                print(f"   Actual schedule makespan: {actual_makespan:.2f}")
+                print(f"   This explains why RL appears to beat MILP - MILP solution is invalid!")
+                return float('inf'), {}  # Return invalid result
+            
+            print(f"✅ MILP OPTIMAL SOLUTION VALIDATED!")
+            print(f"   Optimal Makespan: {optimal_makespan:.2f}")
+            print(f"   This represents the THEORETICAL BEST possible performance")
+            print(f"   with perfect knowledge of arrival times: {arrival_times}")
+            
+            # DO NOT cache result - force fresh computation each time for debugging
+            print(f"   ⚠️  Caching disabled for debugging - fresh computation each run")
+            
             return optimal_makespan, schedule
+            
         else:
-            if verbose:
-                print("❌ Validation mismatch or couldn't compute actual makespan.")
-                print("   MILP claim:", optimal_makespan, "actual:", actual_makespan)
-            return float('inf'), {}
-    else:
-        if verbose:
-            print("❌ Solver did not find optimal solution. Status:", status)
-        return float('inf'), {}
+            print(f"❌ MILP solver failed to find optimal solution (status: {prob.status})")
+            print("   Possible reasons: problem too complex, time limit exceeded, or infeasible")
+            return float('inf'), schedule
+            
+    except Exception as e:
+        print(f"❌ MILP solver error: {e}")
+        return float('inf'), {m: [] for m in machine_list}
 
 
 def diagnose_performance_similarity(perfect_makespan, dynamic_makespan, static_makespan, spt_makespan):
@@ -2949,7 +2771,7 @@ def main():
     print("📊 DEBUGGING: Action entropy & training metrics tracking enabled")
     print("🚨 STRICT VALIDATION: Will halt execution if any RL outperforms MILP optimal")
     print("=" * 80)
-    arrival_rate = 0.1  # LOWER arrival rate to create more dynamic scenarios
+    arrival_rate = 0.5  # LOWER arrival rate to create more dynamic scenarios
     # With λ=0.5, expected inter-arrival = 2 time units (faster than most job operations)
     
     # Step 1: Training Setup
@@ -2974,7 +2796,7 @@ def main():
     test_scenarios = generate_test_scenarios(ENHANCED_JOBS_DATA, 
                                            initial_jobs=[0, 1, 2], 
                                            arrival_rate=arrival_rate, 
-                                           num_scenarios=5)
+                                           num_scenarios=1)
     
     # Print all test scenario arrival times
     print("\nALL TEST SCENARIO ARRIVAL TIMES:")
@@ -3054,8 +2876,6 @@ def main():
     print(f"\nEvaluating on {len(test_scenarios)} test scenarios...")
     
     for i, scenario in enumerate(test_scenarios):
-        print("\n" + "-"*60)
-        print(f"SCENARIO {i+1}/{len(test_scenarios)}")
         scenario_arrivals = scenario['arrival_times']
         print(f"\nScenario {i+1}/10: {scenario_arrivals}")
         # Train Perfect Knowledge RL specifically for this scenario
@@ -3169,9 +2989,9 @@ def main():
                     print(f"    🚨 WARNING: {method1} and {method2} produced identical schedules!")
         
         print()  # Empty line for readability
-
-        # Store first 5 scenarios for Gantt plotting
-        if i < 5:
+        
+        # Store first 3 scenarios for Gantt plotting
+        if i < 3:
             gantt_scenarios_data.append({
                 'scenario_id': i,
                 'arrival_times': scenario_arrivals,
@@ -3513,7 +3333,7 @@ def main():
         print(f"✅ Saved comparison without MILP: {filename}")
     
     plt.show()
-
+    
     # Skip the separate static RL comparison - focus on 10 test scenarios
     # Step 8: Create Gantt Charts for All 10 Test Scenarios (5 methods only)
     print(f"\n8. GANTT CHARTS FOR ALL 10 TEST SCENARIOS")
@@ -3521,7 +3341,7 @@ def main():
     
     # Create small_instances folder
     import os
-    folder_name = "small_instances_0.05"
+    folder_name = "small_instances_0.1"
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
         print(f"Created folder: {folder_name}")

@@ -1128,7 +1128,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,
+        verbose=1,
         learning_rate=learning_rate,        # IDENTICAL across all RL methods
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=128,            # IDENTICAL across all RL methods
@@ -1184,7 +1184,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     with tqdm(total=total_timesteps, desc=f"Perfect Knowledge RL", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Perfect Knowledge RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Perfect Knowledge RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     # More thorough post-training evaluation
@@ -1241,7 +1241,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,  # Minimal output
+        verbose=1,  # Minimal output
         learning_rate=learning_rate,
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=128,            # IDENTICAL across all RL methods
@@ -1270,7 +1270,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     with tqdm(total=total_timesteps, desc="Static RL Training", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Static RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Static RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
@@ -1308,7 +1308,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,
+        verbose=1,
         learning_rate=learning_rate,        # IDENTICAL across all RL methods
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=256,            # IDENTICAL across all RL methods
@@ -1337,7 +1337,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     with tqdm(total=total_timesteps, desc="Dynamic RL Training", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Dynamic RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Dynamic RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
@@ -1581,7 +1581,7 @@ def plot_training_metrics():
     plt.tight_layout()
     plt.savefig(f'enhanced_ppo_training_metrics_{TRAINING_METRICS.get("method_name", "RL Agent")}.png', dpi=300, bbox_inches='tight')
     print(f"✅ Enhanced training metrics plot saved: enhanced_ppo_training_metrics_{TRAINING_METRICS.get('method_name', 'RL Agent')}.png")
-    plt.pause(1)
+    plt.pause(0.001)
     # print_training_summary()
 
 def print_training_summary():
@@ -1725,94 +1725,94 @@ def print_training_summary():
     
     print("=" * 50)
 
-# def analyze_training_arrival_distribution():
-#     """
-#     Analyze and plot the distribution of arrival times during training.
-#     This helps identify if the dynamic RL is seeing diverse enough scenarios.
-#     """
-#     global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
+def analyze_training_arrival_distribution():
+    """
+    Analyze and plot the distribution of arrival times during training.
+    This helps identify if the dynamic RL is seeing diverse enough scenarios.
+    """
+    global TRAINING_ARRIVAL_TIMES, TRAINING_EPISODE_COUNT
     
-#     if not TRAINING_ARRIVAL_TIMES:
-#         print("No arrival times recorded during training!")
-#         return
+    if not TRAINING_ARRIVAL_TIMES:
+        print("No arrival times recorded during training!")
+        return
     
-#     print(f"\n=== TRAINING ARRIVAL DISTRIBUTION ANALYSIS ===")
-#     print(f"Total episodes: {TRAINING_EPISODE_COUNT}")
-#     print(f"Total dynamic arrivals recorded: {len(TRAINING_ARRIVAL_TIMES)}")
-#     print(f"Average arrivals per episode: {len(TRAINING_ARRIVAL_TIMES)/max(TRAINING_EPISODE_COUNT,1):.2f}")
+    print(f"\n=== TRAINING ARRIVAL DISTRIBUTION ANALYSIS ===")
+    print(f"Total episodes: {TRAINING_EPISODE_COUNT}")
+    print(f"Total dynamic arrivals recorded: {len(TRAINING_ARRIVAL_TIMES)}")
+    print(f"Average arrivals per episode: {len(TRAINING_ARRIVAL_TIMES)/max(TRAINING_EPISODE_COUNT,1):.2f}")
     
-#     # Statistics
-#     arrival_times = np.array(TRAINING_ARRIVAL_TIMES)
-#     print(f"Arrival time statistics:")
-#     print(f"  Min: {np.min(arrival_times):.2f}")
-#     print(f"  Max: {np.max(arrival_times):.2f}")
-#     print(f"  Mean: {np.mean(arrival_times):.2f}")
-#     print(f"  Std: {np.std(arrival_times):.2f}")
+    # Statistics
+    arrival_times = np.array(TRAINING_ARRIVAL_TIMES)
+    print(f"Arrival time statistics:")
+    print(f"  Min: {np.min(arrival_times):.2f}")
+    print(f"  Max: {np.max(arrival_times):.2f}")
+    print(f"  Mean: {np.mean(arrival_times):.2f}")
+    print(f"  Std: {np.std(arrival_times):.2f}")
     
-#     # Create distribution plot
-#     plt.figure(figsize=(15, 10))
+    # Create distribution plot
+    plt.figure(figsize=(15, 10))
     
-#     # Plot 1: Histogram of arrival times
-#     plt.subplot(2, 2, 1)
-#     plt.hist(arrival_times, bins=50, alpha=0.7, edgecolor='black')
-#     plt.xlabel('Arrival Time')
-#     plt.ylabel('Frequency')
-#     plt.title(f'Distribution of Job Arrival Times During Training\n({len(TRAINING_ARRIVAL_TIMES)} arrivals across {TRAINING_EPISODE_COUNT} episodes)')
-#     plt.grid(True, alpha=0.3)
+    # Plot 1: Histogram of arrival times
+    plt.subplot(2, 2, 1)
+    plt.hist(arrival_times, bins=50, alpha=0.7, edgecolor='black')
+    plt.xlabel('Arrival Time')
+    plt.ylabel('Frequency')
+    plt.title(f'Distribution of Job Arrival Times During Training\n({len(TRAINING_ARRIVAL_TIMES)} arrivals across {TRAINING_EPISODE_COUNT} episodes)')
+    plt.grid(True, alpha=0.3)
     
-#     # Plot 2: Box plot
-#     plt.subplot(2, 2, 2)
-#     plt.boxplot(arrival_times, vert=True)
-#     plt.ylabel('Arrival Time')
-#     plt.title('Box Plot of Arrival Times')
-#     plt.grid(True, alpha=0.3)
+    # Plot 2: Box plot
+    plt.subplot(2, 2, 2)
+    plt.boxplot(arrival_times, vert=True)
+    plt.ylabel('Arrival Time')
+    plt.title('Box Plot of Arrival Times')
+    plt.grid(True, alpha=0.3)
     
-#     # Plot 3: Cumulative distribution
-#     plt.subplot(2, 2, 3)
-#     sorted_arrivals = np.sort(arrival_times)
-#     y_vals = np.arange(1, len(sorted_arrivals) + 1) / len(sorted_arrivals)
-#     plt.plot(sorted_arrivals, y_vals, linewidth=2)
-#     plt.xlabel('Arrival Time')
-#     plt.ylabel('Cumulative Probability')
-#     plt.title('Cumulative Distribution of Arrival Times')
-#     plt.grid(True, alpha=0.3)
+    # Plot 3: Cumulative distribution
+    plt.subplot(2, 2, 3)
+    sorted_arrivals = np.sort(arrival_times)
+    y_vals = np.arange(1, len(sorted_arrivals) + 1) / len(sorted_arrivals)
+    plt.plot(sorted_arrivals, y_vals, linewidth=2)
+    plt.xlabel('Arrival Time')
+    plt.ylabel('Cumulative Probability')
+    plt.title('Cumulative Distribution of Arrival Times')
+    plt.grid(True, alpha=0.3)
     
-#     # Plot 4: Inter-arrival times
-#     if len(arrival_times) > 1:
-#         plt.subplot(2, 2, 4)
-#         # Group by episodes and calculate inter-arrival times within episodes
-#         inter_arrivals = []
-#         episode_arrivals = []
-#         current_episode_times = []
+    # Plot 4: Inter-arrival times
+    if len(arrival_times) > 1:
+        plt.subplot(2, 2, 4)
+        # Group by episodes and calculate inter-arrival times within episodes
+        inter_arrivals = []
+        episode_arrivals = []
+        current_episode_times = []
         
-#         # Simple approximation: assume arrivals are chronological within batches
-#         sorted_times = np.sort(arrival_times)
-#         for i in range(1, len(sorted_times)):
-#             inter_arrival = sorted_times[i] - sorted_times[i-1]
-#             if inter_arrival > 0 and inter_arrival < 100:  # Filter reasonable inter-arrivals
-#                 inter_arrivals.append(inter_arrival)
+        # Simple approximation: assume arrivals are chronological within batches
+        sorted_times = np.sort(arrival_times)
+        for i in range(1, len(sorted_times)):
+            inter_arrival = sorted_times[i] - sorted_times[i-1]
+            if inter_arrival > 0 and inter_arrival < 100:  # Filter reasonable inter-arrivals
+                inter_arrivals.append(inter_arrival)
         
-#         if inter_arrivals:
-#             plt.hist(inter_arrivals, bins=30, alpha=0.7, edgecolor='black')
-#             plt.xlabel('Inter-arrival Time')
-#             plt.ylabel('Frequency')
-#             plt.title(f'Distribution of Inter-arrival Times\n(Mean: {np.mean(inter_arrivals):.2f})')
-#             plt.grid(True, alpha=0.3)
+        if inter_arrivals:
+            plt.hist(inter_arrivals, bins=30, alpha=0.7, edgecolor='black')
+            plt.xlabel('Inter-arrival Time')
+            plt.ylabel('Frequency')
+            plt.title(f'Distribution of Inter-arrival Times\n(Mean: {np.mean(inter_arrivals):.2f})')
+            plt.grid(True, alpha=0.3)
     
-#     plt.tight_layout()
-#     plt.savefig('training_arrival_distribution.png', dpi=300, bbox_inches='tight')
-#     plt.pause(1)
+    plt.tight_layout()
+    plt.savefig('training_arrival_distribution.png', dpi=300, bbox_inches='tight')
+    plt.pause(0.001)
 
-#     # Check if distribution is diverse enough
-#     unique_times = len(np.unique(np.round(arrival_times, 1)))
-#     print(f"\nDiversity Analysis:")
-#     print(f"  Unique arrival times (rounded to 0.1): {unique_times}")
-#     print(f"  Time span: {np.max(arrival_times) - np.min(arrival_times):.2f}")
+    # Check if distribution is diverse enough
+    unique_times = len(np.unique(np.round(arrival_times, 1)))
+    print(f"\nDiversity Analysis:")
+    print(f"  Unique arrival times (rounded to 0.1): {unique_times}")
+    print(f"  Time span: {np.max(arrival_times) - np.min(arrival_times):.2f}")
     
-#     if unique_times < 20:
-#         print("⚠️  WARNING: Low diversity in arrival times may limit learning")
-#     else:
-#         print("✅ Good diversity in arrival times")
+    if unique_times < 20:
+        print("⚠️  WARNING: Low diversity in arrival times may limit learning")
+    else:
+        print("✅ Good diversity in arrival times")
 
 
 def create_perfect_knowledge_scenario(base_scenario):
@@ -1989,7 +1989,7 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
     test_env = PoissonDynamicFJSPEnv(
         jobs_data, machine_list,
         initial_jobs=[k for k, v in arrival_times.items() if v == 0],
-        arrival_rate=0.05,  # Rate doesn't matter since we'll override
+        arrival_rate=0.1,  # Rate doesn't matter since we'll override
         reward_mode=reward_mode,
         seed=GLOBAL_SEED,
         max_time_horizon=max([t for t in arrival_times.values() if t != float('inf')] + [200])
@@ -2456,14 +2456,14 @@ def validate_schedule_makespan(schedule, jobs_data, arrival_times):
 #     import os
 #     import hashlib
     
-    # CACHE CLEARING: Remove all existing MILP cache files to force fresh computation
-    # cache_files = [f for f in os.listdir('.') if f.startswith('milp_cache_') and f.endswith('.pkl')]
-    # for cache_file in cache_files:
-    #     try:
-    #         os.remove(cache_file)
-    #         print(f"🧹 Cleared cache file: {cache_file}")
-    #     except:
-    #         pass
+#     # # CACHE CLEARING: Remove all existing MILP cache files to force fresh computation
+#     # cache_files = [f for f in os.listdir('.') if f.startswith('milp_cache_') and f.endswith('.pkl')]
+#     # for cache_file in cache_files:
+#     #     try:
+#     #         os.remove(cache_file)
+#     #         print(f"🧹 Cleared cache file: {cache_file}")
+#     #     except:
+#     #         pass
 
 #     print("\n--- Running MILP Optimal Scheduler ---")
 #     print(f"Jobs: {len(jobs_data)}, Machines: {len(machine_list)}")
@@ -2576,7 +2576,7 @@ def validate_schedule_makespan(schedule, jobs_data, arrival_times):
 #         print(f"❌ MILP solver error: {e}")
 #         return float('inf'), {m: [] for m in machine_list}
 
-def milp_optimal_scheduler(jobs_data, machine_list, arrival_times, time_limit=300, verbose=True):
+def milp_optimal_scheduler(jobs_data, machine_list, arrival_times, time_limit=300, verbose=False):
     """
     MILP approach for optimal dynamic scheduling with perfect knowledge.
 
@@ -2595,16 +2595,7 @@ def milp_optimal_scheduler(jobs_data, machine_list, arrival_times, time_limit=30
     # Imports required for pulp
     from pulp import (LpProblem, LpMinimize, LpVariable, lpSum, PULP_CBC_CMD, LpStatus)
     import math
-    import os
     import itertools
-
-    cache_files = [f for f in os.listdir('.') if f.startswith('milp_cache_') and f.endswith('.pkl')]
-    for cache_file in cache_files:
-        try:
-            os.remove(cache_file)
-            print(f"🧹 Cleared cache file: {cache_file}")
-        except:
-            pass
 
     # Check that validate_schedule_makespan exists
     if 'validate_schedule_makespan' not in globals():
@@ -2710,10 +2701,6 @@ def milp_optimal_scheduler(jobs_data, machine_list, arrival_times, time_limit=30
     status = LpStatus[prob.status]
     if verbose:
         print("Solver status:", status)
-    if LpStatus[prob.status] == "Optimal":
-        print("✅ True optimal solution found.")
-    else:
-        print("⚠️  Feasible but not proven optimal.")
 
     schedule = {m: [] for m in machine_list}
     if status == "Optimal" or status == "Not Solved" or status == "Optimal":  # Prefer explicit 'Optimal' but accept near-optimal?
@@ -2974,7 +2961,7 @@ def main():
     test_scenarios = generate_test_scenarios(ENHANCED_JOBS_DATA, 
                                            initial_jobs=[0, 1, 2], 
                                            arrival_rate=arrival_rate, 
-                                           num_scenarios=5)
+                                           num_scenarios=1)
     
     # Print all test scenario arrival times
     print("\nALL TEST SCENARIO ARRIVAL TIMES:")
@@ -3054,8 +3041,6 @@ def main():
     print(f"\nEvaluating on {len(test_scenarios)} test scenarios...")
     
     for i, scenario in enumerate(test_scenarios):
-        print("\n" + "-"*60)
-        print(f"SCENARIO {i+1}/{len(test_scenarios)}")
         scenario_arrivals = scenario['arrival_times']
         print(f"\nScenario {i+1}/10: {scenario_arrivals}")
         # Train Perfect Knowledge RL specifically for this scenario
@@ -3169,9 +3154,9 @@ def main():
                     print(f"    🚨 WARNING: {method1} and {method2} produced identical schedules!")
         
         print()  # Empty line for readability
-
-        # Store first 5 scenarios for Gantt plotting
-        if i < 5:
+        
+        # Store first 3 scenarios for Gantt plotting
+        if i < 3:
             gantt_scenarios_data.append({
                 'scenario_id': i,
                 'arrival_times': scenario_arrivals,
@@ -3512,7 +3497,7 @@ def main():
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         print(f"✅ Saved comparison without MILP: {filename}")
     
-    plt.show()
+    plt.pause(0.001)
 
     # Skip the separate static RL comparison - focus on 10 test scenarios
     # Step 8: Create Gantt Charts for All 10 Test Scenarios (5 methods only)
@@ -3521,7 +3506,7 @@ def main():
     
     # Create small_instances folder
     import os
-    folder_name = "small_instances_0.05"
+    folder_name = "small_instances_0.1"
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
         print(f"Created folder: {folder_name}")

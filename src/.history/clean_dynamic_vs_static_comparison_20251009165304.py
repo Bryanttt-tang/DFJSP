@@ -1128,7 +1128,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,
+        verbose=1,
         learning_rate=learning_rate,        # IDENTICAL across all RL methods
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=128,            # IDENTICAL across all RL methods
@@ -1184,7 +1184,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
     with tqdm(total=total_timesteps, desc=f"Perfect Knowledge RL", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Perfect Knowledge RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Perfect Knowledge RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     # More thorough post-training evaluation
@@ -1241,7 +1241,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,  # Minimal output
+        verbose=1,  # Minimal output
         learning_rate=learning_rate,
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=128,            # IDENTICAL across all RL methods
@@ -1270,7 +1270,7 @@ def train_static_agent(jobs_data, machine_list, total_timesteps=300000, reward_m
     with tqdm(total=total_timesteps, desc="Static RL Training", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Static RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Static RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
@@ -1308,7 +1308,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
-        verbose=0,
+        verbose=1,
         learning_rate=learning_rate,        # IDENTICAL across all RL methods
         n_steps=512,              # IDENTICAL across all RL methods
         batch_size=256,            # IDENTICAL across all RL methods
@@ -1337,7 +1337,7 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     with tqdm(total=total_timesteps, desc="Dynamic RL Training", 
               bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} timesteps [{elapsed}<{remaining}]') as pbar:
         
-        callback = EnhancedTrainingCallback("Dynamic RL", pbar=pbar, verbose=0)
+        callback = EnhancedTrainingCallback("Dynamic RL", pbar=pbar, verbose=1)
         model.learn(total_timesteps=total_timesteps, callback=callback)
     
     end_time = time.time()
@@ -1989,7 +1989,7 @@ def evaluate_dynamic_on_dynamic(dynamic_model, jobs_data, machine_list, arrival_
     test_env = PoissonDynamicFJSPEnv(
         jobs_data, machine_list,
         initial_jobs=[k for k, v in arrival_times.items() if v == 0],
-        arrival_rate=0.05,  # Rate doesn't matter since we'll override
+        arrival_rate=0.1,  # Rate doesn't matter since we'll override
         reward_mode=reward_mode,
         seed=GLOBAL_SEED,
         max_time_horizon=max([t for t in arrival_times.values() if t != float('inf')] + [200])
@@ -2710,10 +2710,6 @@ def milp_optimal_scheduler(jobs_data, machine_list, arrival_times, time_limit=30
     status = LpStatus[prob.status]
     if verbose:
         print("Solver status:", status)
-    if LpStatus[prob.status] == "Optimal":
-        print("✅ True optimal solution found.")
-    else:
-        print("⚠️  Feasible but not proven optimal.")
 
     schedule = {m: [] for m in machine_list}
     if status == "Optimal" or status == "Not Solved" or status == "Optimal":  # Prefer explicit 'Optimal' but accept near-optimal?
@@ -3054,8 +3050,6 @@ def main():
     print(f"\nEvaluating on {len(test_scenarios)} test scenarios...")
     
     for i, scenario in enumerate(test_scenarios):
-        print("\n" + "-"*60)
-        print(f"SCENARIO {i+1}/{len(test_scenarios)}")
         scenario_arrivals = scenario['arrival_times']
         print(f"\nScenario {i+1}/10: {scenario_arrivals}")
         # Train Perfect Knowledge RL specifically for this scenario
@@ -3169,8 +3163,8 @@ def main():
                     print(f"    🚨 WARNING: {method1} and {method2} produced identical schedules!")
         
         print()  # Empty line for readability
-
-        # Store first 5 scenarios for Gantt plotting
+        
+        # Store first 3 scenarios for Gantt plotting
         if i < 5:
             gantt_scenarios_data.append({
                 'scenario_id': i,
@@ -3521,7 +3515,7 @@ def main():
     
     # Create small_instances folder
     import os
-    folder_name = "small_instances_0.05"
+    folder_name = "small_instances_0.1"
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
         print(f"Created folder: {folder_name}")
