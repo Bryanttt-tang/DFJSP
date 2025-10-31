@@ -1,0 +1,262 @@
+"""
+Visual Summary: Three FJSP Scheduling Environments
+===================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         INFORMATION HIERARCHY                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌───────────────────────────────────────────┐
+    │  PerfectKnowledgeFJSPEnv                  │
+    │  ─────────────────────────────────────    │
+    │  ✓ Exact arrival times for ALL jobs      │
+    │  ✓ Can schedule any job from start       │
+    │  ✓ Optimal planning possible             │
+    │  ✗ Unrealistic (oracle)                  │
+    └───────────────────────────────────────────┘
+                    ▲
+                    │ More Information
+                    │
+    ┌───────────────────────────────────────────┐
+    │  ProactiveDynamicFJSPEnv ⭐                │
+    │  ─────────────────────────────────────    │
+    │  ✓ PREDICTS arrivals using MLE           │
+    │  ✓ Learns from history (cross-episode)   │
+    │  ✓ Prediction window (e.g., 10 units)    │
+    │  ✓ Self-correcting from errors           │
+    │  ⚠ Predictions may be wrong initially    │
+    └───────────────────────────────────────────┘
+                    ▲
+                    │ More Information
+                    │
+    ┌───────────────────────────────────────────┐
+    │  PoissonDynamicFJSPEnv (Reactive)         │
+    │  ─────────────────────────────────────    │
+    │  ✓ Knows Poisson rate λ                  │
+    │  ✓ Sees jobs after arrival               │
+    │  ✗ NO prediction capability              │
+    │  ✗ NO planning for future arrivals       │
+    │  ✗ Purely reactive                       │
+    └───────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     OBSERVATION SPACE FEATURES                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Feature                          │ Reactive │ Proactive │ Perfect
+─────────────────────────────────┼──────────┼───────────┼─────────
+Ready job indicators             │    ✓     │     ✓     │    ✓
+Job progress                     │    ✓     │     ✓     │    ✓
+Machine status                   │    ✓     │     ✓     │    ✓
+Processing times (arrived jobs)  │    ✓     │     ✓     │    ✓
+─────────────────────────────────┼──────────┼───────────┼─────────
+Arrived job arrival times        │    ✓     │     ✓     │    ✓
+─────────────────────────────────┼──────────┼───────────┼─────────
+PREDICTED arrival times          │    ✗     │   ⭐ ✓    │    ✗
+EXACT future arrival times       │    ✗     │     ✗     │  ⭐ ✓
+Estimated arrival rate (λ)       │    ✗     │   ⭐ ✓    │    ✗
+Prediction confidence            │    ✗     │   ⭐ ✓    │    ✗
+─────────────────────────────────┼──────────┼───────────┼─────────
+UNIQUE FEATURES                  │   None   │ Predictor │  Oracle
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ACTION MASKING LOGIC                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PoissonDynamicFJSPEnv (Reactive):
+┌─────────────────────────────────────────────┐
+│ Can Schedule:                               │
+│  ✓ Arrived jobs only                        │
+│  ✓ On compatible machines                   │
+│  ✓ WAIT to advance time                     │
+│                                             │
+│ Cannot Schedule:                            │
+│  ✗ Unarrived jobs (strict constraint)       │
+└─────────────────────────────────────────────┘
+
+ProactiveDynamicFJSPEnv (Proactive): ⭐
+┌─────────────────────────────────────────────┐
+│ Can Schedule:                               │
+│  ✓ Arrived jobs (like Reactive)             │
+│  ⭐ Predicted jobs within window            │
+│     if pred_time ≤ event_time + window      │
+│  ✓ WAIT to advance time                     │
+│                                             │
+│ Prediction Window Example:                  │
+│  event_time = 5, window = 10                │
+│  Job A predicted at t=8  → ✓ schedulable    │
+│  Job B predicted at t=12 → ✓ schedulable    │
+│  Job C predicted at t=20 → ✗ too far        │
+└─────────────────────────────────────────────┘
+
+PerfectKnowledgeFJSPEnv (Perfect):
+┌─────────────────────────────────────────────┐
+│ Can Schedule:                               │
+│  ✓ ALL jobs (no arrival constraint)         │
+│  ✓ Only checks precedence & compatibility   │
+│                                             │
+│ Cannot:                                     │
+│  ✗ No WAIT action (not needed)              │
+└─────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PREDICTION MECHANISMS                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Reactive RL:  ❌ NONE
+├─ No predictor
+├─ Reacts to arrivals as they happen
+└─ Observation shows 1.0 for all unarrived jobs (no distinction)
+
+Proactive RL: ✅ ArrivalPredictor with MLE ⭐
+├─ Cross-Episode Learning
+│  ├─ Stores last 1000 inter-arrival observations
+│  ├─ Updates global MLE: λ = n / Σ(inter-arrivals)
+│  └─ Improves over training episodes
+├─ Within-Episode Learning
+│  ├─ Observes arrivals: observe_arrival(t)
+│  ├─ Updates current episode MLE
+│  └─ Refines predictions dynamically
+├─ Prediction Generation
+│  ├─ predict_next_arrivals(current_time, n_jobs)
+│  ├─ Uses: E[inter-arrival] = 1/λ
+│  └─ Returns: [t₁, t₂, ..., tₙ]
+├─ Misprediction Correction
+│  ├─ correct_prediction(job_id, predicted, actual)
+│  ├─ Tracks errors: |actual - predicted|
+│  └─ Learns from mistakes
+└─ Confidence Assessment
+   └─ get_confidence() based on observation count
+
+Perfect RL:   ✅ Ground Truth (no prediction needed)
+├─ Receives exact arrival times in constructor
+├─ arrival_times = {0: 0.0, 1: 0.0, 2: 0.0, 3: 8.0, 4: 12.0, ...}
+└─ All jobs visible: arrived_jobs = set(all_job_ids)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    UNIQUE PARAMETERS & COMPONENTS                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PoissonDynamicFJSPEnv:
+  Parameters:
+    - arrival_rate: λ (Poisson rate)
+    - max_time_horizon: Episode limit
+    - initial_jobs: Jobs available at t=0
+  
+  Components:
+    - arrived_jobs: Set of arrived job IDs
+    - event_time: Current event frontier
+
+ProactiveDynamicFJSPEnv: ⭐
+  Parameters:
+    - arrival_rate: λ (TRUE rate, hidden from agent)
+    - prediction_window: How far ahead to schedule (UNIQUE) ⭐
+    - max_time_horizon: Episode limit
+    - initial_jobs: Jobs available at t=0
+  
+  Components: ⭐
+    - arrival_predictor: ArrivalPredictor instance (UNIQUE)
+    - predicted_arrival_times: {job_id: predicted_time} (UNIQUE)
+    - arrived_jobs: Set of arrived job IDs
+    - event_time: Current event frontier
+
+PerfectKnowledgeFJSPEnv:
+  Parameters:
+    - arrival_times: EXACT arrival times (given) ⭐
+    - reward_mode: Reward function type
+  
+  Components:
+    - job_arrival_times: Exact times (oracle knowledge)
+    - arrived_jobs: ALL jobs (visible from start)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    EXPECTED PERFORMANCE RANKING                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Best ──►  Perfect Knowledge RL
+           │
+           │ ≥ (Oracle advantage)
+           │
+           ▼
+          Proactive RL ⭐
+           │  (Learned predictions + window)
+           │
+           │ ≥ (Prediction advantage)
+           │
+           ▼
+          Reactive RL
+           │  (No foresight)
+           │
+           │ ≥ (Handles dynamics)
+           │
+           ▼
+Worst ──► Static RL
+          (Ignores arrivals entirely)
+
+
+Proactive RL Advantages:
+  ✓ Better resource utilization (can prepare for arrivals)
+  ✓ Reduced idle time (proactive scheduling)
+  ✓ Improved load balancing
+  ✓ Gets better over episodes (cross-episode learning)
+  ⚠ Risk: Initial predictions may be inaccurate (but improves)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PRACTICAL REALISM ASSESSMENT                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Environment          │ Realism  │ Use Case
+─────────────────────┼──────────┼──────────────────────────────────────
+Reactive RL          │  ★★★★☆   │ Baseline, conservative approach
+Proactive RL ⭐       │  ★★★★★   │ Real-world with historical data
+Perfect Knowledge RL │  ★☆☆☆☆   │ Theoretical upper bound only
+
+Proactive RL is the MOST PRACTICALLY RELEVANT:
+  ✓ Uses realistic information (historical patterns)
+  ✓ Handles uncertainty (predictions have errors)
+  ✓ Learns and adapts (gets better with experience)
+  ✓ Bridges gap between reactive and optimal
+  ✓ Applicable to real manufacturing systems
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            KEY TAKEAWAYS                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1. Only Proactive RL has PREDICTION CAPABILITY ⭐
+   - ArrivalPredictor with Maximum Likelihood Estimation
+   - Cross-episode learning (improves over 100+ episodes)
+   - Within-episode updates (adaptive)
+   - Self-correcting from mispredictions
+
+2. Only Proactive RL has PREDICTION WINDOW ⭐
+   - Allows scheduling jobs predicted to arrive soon
+   - Tunable parameter (e.g., 10-15 time units)
+   - Trade-off: larger window = more proactive but riskier
+
+3. Information Progression: Reactive < Proactive < Perfect
+   - Reactive: No foresight (reacts to arrivals)
+   - Proactive: Learned foresight (predicts arrivals)
+   - Perfect: Complete foresight (oracle knowledge)
+
+4. Action Space Flexibility: Reactive < Proactive < Perfect
+   - Reactive: Only arrived jobs
+   - Proactive: Arrived + predicted (within window)
+   - Perfect: All jobs
+
+5. Learning Components:
+   - Reactive: RL policy only
+   - Proactive: RL policy + Arrival predictor (multi-level learning) ⭐
+   - Perfect: RL policy only (no prediction needed)
+
+6. Research Significance:
+   Proactive RL demonstrates that LEARNING ARRIVAL PATTERNS
+   enables better scheduling than purely reactive approaches,
+   while remaining realistic and practical for real-world deployment.
+"""

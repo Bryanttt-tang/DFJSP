@@ -887,7 +887,8 @@ class PoissonDynamicFJSPEnv(gym.Env):
                 normalized_busy = min(1.0, machine_free_time / self.max_time_horizon)
                 obs.append(normalized_busy)
         
-            # 4. Processing times for ready operations: normalized against max_proc_time across all operations
+            # 4. Processing times for ready operations
+            # Only reveal for ARRIVED jobs, use 0.0 for unarrived/completed
             for job_id in self.job_ids:
                 if (job_id in self.arrived_jobs and 
                     self.next_operation[job_id] < len(self.jobs[job_id])):
@@ -1497,22 +1498,6 @@ class ProactiveDynamicFJSPEnv(gym.Env):
         """
         obs_parts = []
         
-        # # 1. Ready job indicators (arrived OR predicted within window)
-        # ready_jobs = []
-        # for job_id in self.job_ids:
-        #     if job_id in self.completed_jobs:
-        #         ready_jobs.append(0.0)
-        #     elif job_id in self.arrived_jobs:
-        #         ready_jobs.append(1.0)
-        #     elif job_id in self.predicted_arrival_times:
-        #         pred_time = self.predicted_arrival_times[job_id]
-        #         if pred_time <= self.event_time + self.prediction_window:
-        #             ready_jobs.append(0.5)  # Predicted but not arrived
-        #         else:
-        #             ready_jobs.append(0.0)
-        #     else:
-        #         ready_jobs.append(0.0)
-        # obs_parts.extend(ready_jobs)
         # 1. Job ready time (when job can start its NEXT operation)
         # For ARRIVED jobs: actual ready time
         # For UNARRIVED jobs: 1.0 (max value = far future, prevents cheating)
@@ -2353,7 +2338,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
         normalize_advantage=True,
         policy_kwargs=dict(
             net_arch=dict(
-                pi=[512, 512, 256],    # ✅ Policy network: deeper for complex decisions
+                pi=[512, 512, 256, 128],    # ✅ Policy network: deeper for complex decisions
                 vf=[512, 256, 128]     # ✅ Value network: separate architecture for better learning
             ),
             activation_fn=torch.nn.ReLU
@@ -4499,10 +4484,10 @@ def main():
     # Step 1: Training Setup
     print("\n1. TRAINING SETUP")
     print("-" * 50)
-    perfect_timesteps = 500000    # Perfect knowledge needs less training
-    dynamic_timesteps = 500000   # Increased for better learning with integer timing  
-    static_timesteps = 500000    # Increased for better learning
-    learning_rate = 5e-4       # Standard learning rate for PPO
+    perfect_timesteps = 300000    # Perfect knowledge needs less training
+    dynamic_timesteps = 300000   # Increased for better learning with integer timing  
+    static_timesteps = 300000    # Increased for better learning
+    learning_rate = 3e-4       # Standard learning rate for PPO
     
     print(f"Perfect RL: {perfect_timesteps:,} | Reactive RL: {dynamic_timesteps:,} | Static RL: {static_timesteps:,} timesteps")
     print(f"Arrival rate: {arrival_rate} (expected inter-arrival: {1/arrival_rate:.1f} time units)")

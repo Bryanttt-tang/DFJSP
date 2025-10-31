@@ -840,25 +840,15 @@ class PoissonDynamicFJSPEnv(gym.Env):
     #     return -proc_time
 
     def _get_observation(self):
-        """
-        BUILDER MODE: Event-driven observation using event_time for arrival visibility.
-        IMPORTANT: Do NOT reveal information about unarrived jobs (no cheating!)
-        """
+        """BUILDER MODE: Event-driven observation using event_time for arrival visibility."""
         obs = []
         if not self.cheat:    
+            # 1. Ready job indicators: 1 if job has arrived and has a next operation, else 0
             # 1. Job ready time (when job can start its NEXT operation)
-            # For ARRIVED jobs: actual ready time
-            # For UNARRIVED jobs: 1.0 (max value = far future, prevents cheating)
-            # For COMPLETED jobs: 0.0 (done)
+        # This captures job precedence constraints and arrival times
             for job_id in self.job_ids:
-                if job_id not in self.arrived_jobs:
-                    # NOT ARRIVED YET: 1.0 (no information leakage!)
-                    obs.append(1.0)
-                elif self.next_operation[job_id] >= len(self.jobs[job_id]):
-                    # COMPLETED: 0.0
-                    obs.append(0.0)
-                else:
-                    # ARRIVED and HAS REMAINING OPERATIONS: compute actual ready time
+                if self.next_operation[job_id] < len(self.jobs[job_id]):
+                    # Job has remaining operations
                     next_op_idx = self.next_operation[job_id]
                     
                     # Job ready time = max(previous_op_end_time, arrival_time)
@@ -872,6 +862,10 @@ class PoissonDynamicFJSPEnv(gym.Env):
                     # Normalize against max_time_horizon
                     normalized_ready_time = min(1.0, job_ready_time / self.max_time_horizon)
                     obs.append(normalized_ready_time)
+                else:
+                    # Job completed - use 0.0 to indicate "done"
+                    obs.append(0.0)
+
             
             # 2. Job progress (completed_ops / total_ops for each job)
             for job_id in self.job_ids:
@@ -900,9 +894,8 @@ class PoissonDynamicFJSPEnv(gym.Env):
                             normalized_time = min(1.0, proc_time / self.max_time_horizon)
                             obs.append(normalized_time)
                         else:
-                            obs.append(0.0)  # Incompatible machine
+                            obs.append(0.0)
                 else:
-                    # Unarrived or completed: all 0.0
                     for machine in self.machines:
                         obs.append(0.0)
             
@@ -915,7 +908,7 @@ class PoissonDynamicFJSPEnv(gym.Env):
                     normalized_arrival_time = min(1.0, arrival_time / self.max_time_horizon)
                     obs.append(normalized_arrival_time)
                 else:
-                    # Not yet arrived: 1.0 (no information leakage)
+                    # Not yet arrived: 1
                     obs.append(1.0)
             
             # 5.2. Arrival progress
@@ -1497,22 +1490,6 @@ class ProactiveDynamicFJSPEnv(gym.Env):
         """
         obs_parts = []
         
-        # # 1. Ready job indicators (arrived OR predicted within window)
-        # ready_jobs = []
-        # for job_id in self.job_ids:
-        #     if job_id in self.completed_jobs:
-        #         ready_jobs.append(0.0)
-        #     elif job_id in self.arrived_jobs:
-        #         ready_jobs.append(1.0)
-        #     elif job_id in self.predicted_arrival_times:
-        #         pred_time = self.predicted_arrival_times[job_id]
-        #         if pred_time <= self.event_time + self.prediction_window:
-        #             ready_jobs.append(0.5)  # Predicted but not arrived
-        #         else:
-        #             ready_jobs.append(0.0)
-        #     else:
-        #         ready_jobs.append(0.0)
-        # obs_parts.extend(ready_jobs)
         # 1. Job ready time (when job can start its NEXT operation)
         # For ARRIVED jobs: actual ready time
         # For UNARRIVED jobs: 1.0 (max value = far future, prevents cheating)
@@ -2353,7 +2330,7 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
         normalize_advantage=True,
         policy_kwargs=dict(
             net_arch=dict(
-                pi=[512, 512, 256],    # ✅ Policy network: deeper for complex decisions
+                pi=[512, 512, 256, 128],    # ✅ Policy network: deeper for complex decisions
                 vf=[512, 256, 128]     # ✅ Value network: separate architecture for better learning
             ),
             activation_fn=torch.nn.ReLU
@@ -4499,10 +4476,10 @@ def main():
     # Step 1: Training Setup
     print("\n1. TRAINING SETUP")
     print("-" * 50)
-    perfect_timesteps = 500000    # Perfect knowledge needs less training
-    dynamic_timesteps = 500000   # Increased for better learning with integer timing  
-    static_timesteps = 500000    # Increased for better learning
-    learning_rate = 5e-4       # Standard learning rate for PPO
+    perfect_timesteps = 300000    # Perfect knowledge needs less training
+    dynamic_timesteps = 300000   # Increased for better learning with integer timing  
+    static_timesteps = 300000    # Increased for better learning
+    learning_rate = 3e-4       # Standard learning rate for PPO
     
     print(f"Perfect RL: {perfect_timesteps:,} | Reactive RL: {dynamic_timesteps:,} | Static RL: {static_timesteps:,} timesteps")
     print(f"Arrival rate: {arrival_rate} (expected inter-arrival: {1/arrival_rate:.1f} time units)")

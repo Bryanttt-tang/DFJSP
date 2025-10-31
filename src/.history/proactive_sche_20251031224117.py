@@ -4502,7 +4502,7 @@ def main():
     perfect_timesteps = 500000    # Perfect knowledge needs less training
     dynamic_timesteps = 500000   # Increased for better learning with integer timing  
     static_timesteps = 500000    # Increased for better learning
-    learning_rate = 5e-4       # Standard learning rate for PPO
+    learning_rate = 3e-4       # Standard learning rate for PPO
     
     print(f"Perfect RL: {perfect_timesteps:,} | Reactive RL: {dynamic_timesteps:,} | Static RL: {static_timesteps:,} timesteps")
     print(f"Arrival rate: {arrival_rate} (expected inter-arrival: {1/arrival_rate:.1f} time units)")
