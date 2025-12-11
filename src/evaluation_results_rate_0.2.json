@@ -1,0 +1,50 @@
+{
+  "average_results": {
+    "Perfect Knowledge RL": 59.99915656290189,
+    "Proactive RL": 60.335321919254525,
+    "Reactive RL": 66.8353076581979,
+    "Rule-Based RL": 84.32358152389612,
+    "Static RL (dynamic)": 68.33234133183076,
+    "Static RL (static)": 55.08699310739018,
+    "Best Heuristic": 62.90296704892614,
+    "MILP Optimal": 48.0
+  },
+  "std_results": {
+    "Perfect Knowledge RL": 0.0,
+    "Proactive RL": 0.0,
+    "Reactive RL": 0.0,
+    "Rule-Based RL": 0.0,
+    "Static RL (dynamic)": 0.0,
+    "Static RL (static)": 0.0,
+    "Best Heuristic": 0.0,
+    "MILP Optimal": 0.0
+  },
+  "all_results": {
+    "Perfect Knowledge RL": [
+      59.99915656290189
+    ],
+    "Proactive RL": [
+      60.335321919254525
+    ],
+    "Reactive RL": [
+      66.8353076581979
+    ],
+    "Rule-Based RL": [
+      84.32358152389612
+    ],
+    "Static RL (dynamic)": [
+      68.33234133183076
+    ],
+    "Static RL (static)": [
+      55.08699310739018
+    ],
+    "Best Heuristic": [
+      62.90296704892614
+    ],
+    "MILP Optimal": [
+      48.0
+    ]
+  },
+  "arrival_rate": 0.2,
+  "num_scenarios": 1
+}
