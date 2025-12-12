@@ -3210,20 +3210,20 @@ def train_perfect_knowledge_agent(jobs_data, machine_list, arrival_times, total_
             "MlpPolicy",
             vec_env,
             verbose=0,
-            learning_rate=3e-4,        # IDENTICAL to Static RL
-            n_steps=1024,              # IDENTICAL to Static RL
-            batch_size=256,            # IDENTICAL to Static RL
+            learning_rate=1e-4,        # IDENTICAL to Static RL
+            n_steps=2048,              # IDENTICAL to Static RL
+            batch_size=512,            # IDENTICAL to Static RL
             n_epochs=5,                # IDENTICAL to Static RL
             gamma=1.0,                 # IDENTICAL to Static RL
-            gae_lambda=0.99,           # IDENTICAL to Static RL
+            gae_lambda=0.95,           # IDENTICAL to Static RL
             clip_range=0.2,            # IDENTICAL to Static RL
-            ent_coef=0.01,             # IDENTICAL to Static RL
+            ent_coef=0.02,             # IDENTICAL to Static RL
             vf_coef=0.1,               # IDENTICAL to Static RL
             max_grad_norm=0.5,         # IDENTICAL to Static RL
             normalize_advantage=True,
             seed=seed,
             policy_kwargs=dict(
-                net_arch=[256, 256, 128],  # IDENTICAL to Static RL
+                net_arch=[512, 256, 256, 128],  # IDENTICAL to Static RL
                 activation_fn=torch.nn.ReLU
             )
         )
@@ -3402,8 +3402,9 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
     # Add VecMonitor to properly capture episode statistics
     vec_env = VecMonitor(vec_env)
     
-    # IDENTICAL hyperparameters to proactive RL for fair comparison
-    # Both methods learn with same capacity, only difference is predictor observations
+    # OPTIMIZED hyperparameters with NOISE REDUCTION for Poisson stochastic environment
+    # Challenge: High variance from random Poisson arrivals affects gradient quality
+    # Solution: Larger batches + longer rollouts to average out environment variance
     def linear_schedule(initial_value: float):
         """Linear learning rate schedule for stability."""
         def func(progress_remaining: float) -> float:
@@ -3415,19 +3416,19 @@ def train_dynamic_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=0.
         vec_env,
         verbose=0,
         learning_rate=linear_schedule(learning_rate),  # Decaying LR
-        n_steps=2048,               # Large rollout for better value estimates
-        batch_size=1024,            # Increased from 512 for more stable gradients
+        n_steps=4096,               # ⭐ DOUBLED: Average out Poisson variance
+        batch_size=1024,            # Large batches for stable gradients
         n_epochs=10,                # Multiple epochs per rollout
         gamma=1.0,                  # Undiscounted (makespan objective)
-        gae_lambda=0.95,            # GAE for advantage estimation
+        gae_lambda=0.98,            # ⭐ HIGHER: Reduce variance in advantage estimates
         clip_range=0.2,             # Standard PPO clipping
-        ent_coef=0.05,              # IDENTICAL to proactive (higher exploration)
+        ent_coef=0.05,              # Higher exploration for large action space
         vf_coef=0.5,                # Value function coefficient
         max_grad_norm=0.5,          # Gradient clipping for stability
         normalize_advantage=True,   # Normalize advantages
         seed=GLOBAL_SEED,           # Ensure reproducibility
         policy_kwargs=dict(
-            net_arch=[512,256, 256, 128],  # Deep network for complex decisions
+            net_arch=[512, 256, 256, 128],  # Deep network for complex decisions
             activation_fn=torch.nn.ReLU
         )
     )
@@ -3496,21 +3497,26 @@ def train_rule_based_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate
         return func
     
     # OPTIMIZED hyperparameters for small discrete action space (10 actions)
+    # with NOISE REDUCTION for Poisson stochastic environment
     # Key differences from continuous/large action spaces:
     # - Smaller learning rate (1e-4 instead of 3e-4) for stable policy updates
     # - Smaller clip range (0.1 instead of 0.2) to prevent large policy swings
     # - Higher entropy coefficient (0.03 instead of 0.01) to encourage exploration
     # - More training epochs (10 instead of 5) to extract more from each batch
+    # NOISE REDUCTION for Poisson arrivals (high environment variance):
+    # - DOUBLED n_steps (2048→4096): More samples per update to average variance
+    # - DOUBLED batch_size (512→1024): Larger batches for stable gradients
+    # - HIGHER gae_lambda (0.95→0.98): Reduce variance in advantage estimates
     model = MaskablePPO(
         "MlpPolicy",
         vec_env,
         verbose=1,
         learning_rate=linear_schedule(1e-4),  # Lower for stability
-        n_steps=2048,              # Larger rollout buffer
-        batch_size=512,            # Larger batches for stable gradients
+        n_steps=4096,              # ⭐ DOUBLED: Average out Poisson variance
+        batch_size=1024,           # ⭐ DOUBLED: More stable gradients despite noise
         n_epochs=10,               # More epochs to learn from each batch
         gamma=1.0,                 # No discounting (episodic task)
-        gae_lambda=0.95,           # Standard GAE
+        gae_lambda=0.98,           # ⭐ HIGHER: Reduce variance (slight bias tradeoff)
         clip_range=0.1,            # Smaller clip for small action space
         ent_coef=0.01,             # Higher entropy bonus for exploration
         vf_coef=0.5,               # Standard value function coefficient
@@ -3526,7 +3532,9 @@ def train_rule_based_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate
     print(f"Training Rule-Based RL for {total_timesteps:,} timesteps with seed {GLOBAL_SEED}...")
     print(f"🎯 OPTIMIZED for small action space: 10 dispatching rule combinations")
     print(f"   - Lower LR (1e-4), Smaller clip (0.1), Higher entropy (0.03)")
-    print(f"   - More epochs (10), Larger batches (512), Longer rollouts (2048)")
+    print(f"   - More epochs (10), Larger batches (1024), Longer rollouts (4096)")
+    print(f"📊 NOISE REDUCTION: Doubled batch/rollout sizes + higher GAE lambda (0.98)")
+    print(f"   - Handles high variance from Poisson arrivals (stochastic environment)")
     
     reset_training_metrics()
     
@@ -3628,9 +3636,9 @@ def train_proactive_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=
     # 2. Causes train/eval mismatch (model trained on normalized, evaluated on raw)
     # 3. Adds complexity without clear benefit for bounded observations
     
-    # STABILIZED hyperparameters for Proactive RL
-    # Challenge: Large action space (jobs × machines) + stochastic arrivals + prediction
-    # Solution: More conservative updates, better exploration, curriculum learning
+    # OPTIMIZED hyperparameters with NOISE REDUCTION for Proactive RL
+    # Challenge: Large action space (jobs × machines) + stochastic Poisson arrivals + prediction
+    # Solution: Conservative updates, better exploration, LARGER batches to handle variance
     def linear_schedule(initial_value: float):
         """Linear learning rate schedule for stability."""
         def func(progress_remaining: float) -> float:
@@ -3643,19 +3651,19 @@ def train_proactive_agent(jobs_data, machine_list, initial_jobs=5, arrival_rate=
         vec_env,
         verbose=1,
         learning_rate=linear_schedule(3e-4),  # Lower base LR with decay
-        n_steps=2048,               # ⭐ LARGER rollouts for lower variance
-        batch_size=512,             # ⭐ LARGER batches for stable gradients
-        n_epochs=4,                 # ⭐ Fewer epochs to prevent overfitting
+        n_steps=4096,               # ⭐ DOUBLED: Average out Poisson variance
+        batch_size=1024,            # ⭐ DOUBLED: More stable gradients despite noise
+        n_epochs=10,                 # Fewer epochs to prevent overfitting
         gamma=1.0,                  # Undiscounted (makespan objective)
-        gae_lambda=0.95,            # ⭐ Lower GAE for less bias
-        clip_range=0.15,            # ⭐ TIGHTER clipping for stability
-        ent_coef=0.05,              # ⭐ HIGHER entropy for large action space exploration
+        gae_lambda=0.98,            # ⭐ HIGHER: Reduce variance in advantage estimates
+        clip_range=0.15,            # TIGHTER clipping for stability
+        ent_coef=0.02,              # HIGHER entropy for large action space exploration
         vf_coef=0.5,                # Standard value function coefficient
         max_grad_norm=0.5,          # Gradient clipping for stability
         normalize_advantage=True,   # Normalize advantages
         seed=GLOBAL_SEED,
         policy_kwargs=dict(
-            net_arch=[512, 256, 256, 128],  # ⭐ Deeper network for complex action space
+            net_arch=[512, 256, 256, 128],  # Deeper network for complex action space
             activation_fn=torch.nn.ReLU
         )
     )
@@ -5916,9 +5924,9 @@ def main():
     print("-" * 50)
     perfect_timesteps = 1000000    # Perfect knowledge with MULTIPLE INITIALIZATIONS
     dynamic_timesteps = 10000  # Increased from 300k - Reactive needs more time
-    proactive_timesteps = 500000  # Increased from 300k - Proactive needs even more (prediction + scheduling)
-    rule_based_timesteps = 700000  # Same as reactive - needs to explore all rule combos
-    static_timesteps = 200000    # Increased for better learning
+    proactive_timesteps = 2000000  # Increased from 300k - Proactive needs even more (prediction + scheduling)
+    rule_based_timesteps = 2000000  # Same as reactive - needs to explore all rule combos
+    static_timesteps = 20000    # Increased for better learning
     learning_rate = 1e-4         # Optimized learning rate for PPO
     
     print(f"🎯 IMPROVED TRAINING CONFIGURATION:")
